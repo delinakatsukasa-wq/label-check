@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#11161b">
+<title>ラベル照合</title>
+<style>
+  :root{
+    --bg:#11161b; --panel:#1a222a; --panel2:#222d37; --line:#2e3b47;
+    --text:#e9eef3; --dim:#8a99a7; --amber:#ffc300; --ng:#ff4c3b; --ok:#2ed07a;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0; padding:0; height:100%;}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:"Hiragino Kaku Gothic ProN","Noto Sans JP",system-ui,sans-serif;
+    font-size:16px; line-height:1.55;
+    -webkit-user-select:none; user-select:none;
+  }
+  .wrap{padding:12px 12px calc(16px + env(safe-area-inset-bottom)); max-width:640px; margin:0 auto;}
+  h1{font-size:19px; font-weight:800; margin:2px 0 12px; letter-spacing:.02em;}
+  .sub{color:var(--dim); font-size:12px;}
+  button{
+    min-height:52px; padding:0 16px; border-radius:6px; font-size:16px; font-weight:700;
+    background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    font-family:inherit;
+  }
+  button.on{background:var(--amber); color:#191307; border-color:#d6a300;}
+  button.wide{width:100%;}
+  button.sm{min-height:42px; font-size:14px; font-weight:600; padding:0 12px;}
+  button.quiet{background:transparent; color:var(--dim);}
+  button:disabled{opacity:.4;}
+  select{
+    width:100%; min-height:54px; background:var(--panel2); color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:0 12px; font-size:17px;
+    font-family:inherit;
+  }
+  input[type=number]{
+    width:100%; min-height:54px; background:var(--panel2); color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:0 12px; font-size:17px;
+    font-family:inherit;
+  }
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:10px;}
+  .lbl{display:block; font-size:12px; color:var(--dim); margin-bottom:6px;}
+  .row{display:flex; gap:8px;}
+  .row>*{flex:1;}
+  .hidden{display:none !important;}
+  .banner{border-radius:8px; padding:12px; margin-bottom:10px; font-size:14px;}
+  .banner.err{border:1px solid var(--ng); color:var(--ng);}
+  .banner.info{border:1px solid var(--amber); color:var(--amber);}
+
+  /* 対象商品の表示 */
+  .target{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:10px;}
+  .target .nm{font-size:18px; font-weight:700; margin-bottom:10px; line-height:1.35;}
+  .kv{display:flex; align-items:baseline; gap:10px; margin-top:6px;}
+  .kv .k{font-size:12px; color:var(--dim); width:84px; flex:none;}
+  .kv .v{font-size:26px; font-weight:800; letter-spacing:.06em; font-variant-numeric:tabular-nums;}
+  .kv .v.small{font-size:20px; letter-spacing:.02em;}
+
+  /* カメラ */
+  .cam{position:relative; background:#000; border-radius:10px; overflow:hidden; margin-bottom:10px;}
+  .cam video{width:100%; display:block; max-height:46vh; object-fit:cover;}
+  .reticle{
+    position:absolute; left:8%; right:8%; top:28%; bottom:28%;
+    border:2px solid rgba(255,195,0,.85); border-radius:6px; pointer-events:none;
+  }
+  .flash{position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .12s;}
+  .flash.ok{background:rgba(46,208,122,.5); opacity:1;}
+  .flash.ng{background:rgba(255,76,59,.55); opacity:1;}
+
+  /* 判定 */
+  .verdict{border-radius:10px; padding:16px; margin-bottom:10px; border:2px solid var(--line);}
+  .verdict .big{font-size:34px; font-weight:800; line-height:1.1;}
+  .verdict .msg{font-size:14px; color:var(--dim); margin-top:6px;}
+  .verdict.ok{border-color:var(--ok);} .verdict.ok .big{color:var(--ok);}
+  .verdict.ng{border-color:var(--ng);} .verdict.ng .big{color:var(--ng);}
+
+  /* カウンタ */
+  .counts{display:flex; gap:8px; margin-bottom:10px;}
+  .cnt{flex:1; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; text-align:center;}
+  .cnt .n{font-size:30px; font-weight:800; font-variant-numeric:tabular-nums; line-height:1.1;}
+  .cnt .t{font-size:11px; color:var(--dim);}
+  .cnt.ng .n{color:var(--ng);}
+  .cnt.ok .n{color:var(--ok);}
+
+  .log{max-height:200px; overflow-y:auto; -webkit-overflow-scrolling:touch;}
+  .log div{font-size:13px; padding:6px 0; border-bottom:1px solid var(--line); display:flex; gap:10px;}
+  .log .t{color:var(--dim); font-variant-numeric:tabular-nums; flex:none;}
+  .log .r.ok{color:var(--ok);} .log .r.ng{color:var(--ng);}
+  .note{font-size:12px; color:var(--dim); line-height:1.7;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>ラベル照合 <span class="sub" id="verTag"></span></h1>
+
+  <div id="banner" class="banner err hidden"></div>
+
+  <!-- ========== 対象選択 ========== -->
+  <section id="pane-select">
+    <div class="card">
+      <label class="lbl">製造日</label>
+      <select id="selDate"></select>
+    </div>
+    <div class="card">
+      <label class="lbl">商品</label>
+      <select id="selItem"></select>
+    </div>
+    <div id="targetBox"></div>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="on" id="btnMode1">① ラベル確認</button>
+      <button id="btnMode2">② 流しで確認</button>
+    </div>
+    <p class="note">
+      ① はピック前に1枚かざして、その日の商品のラベルで合っているかを確認します。<br>
+      ② は加熱前のバットに沿ってカメラをスライドさせ、バーコードが読めない個体（印字切れ）を音で知らせます。
+    </p>
+    <div class="card">
+      <button class="sm quiet wide" id="btnReload">製造データを読み直す</button>
+    </div>
+  </section>
+
+  <!-- ========== ① ラベル確認 ========== -->
+  <section id="pane-one" class="hidden">
+    <div id="oneTarget"></div>
+    <div class="cam">
+      <video id="v1" playsinline muted></video>
+      <div class="reticle"></div>
+      <div class="flash" id="f1"></div>
+    </div>
+    <div id="oneVerdict" class="verdict hidden">
+      <div class="big" id="oneBig"></div>
+      <div class="msg" id="oneMsg"></div>
+    </div>
+    <div class="card">
+      <p class="note" id="oneHint">バーコードを枠の中に入れてください。読み取ると自動で照合します。</p>
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="sm" id="btnOneRetry">もう一度読む</button>
+      <button class="sm quiet" id="btnOneBack">対象選択へ戻る</button>
+    </div>
+  </section>
+
+  <!-- ========== ② 流しで確認 ========== -->
+  <section id="pane-run" class="hidden">
+    <div id="runTarget"></div>
+    <div class="counts">
+      <div class="cnt ok"><div class="n" id="cOk">0</div><div class="t">OK</div></div>
+      <div class="cnt ng"><div class="n" id="cNg">0</div><div class="t">要確認</div></div>
+      <div class="cnt"><div class="n" id="cSet">—</div><div class="t">並べた数</div></div>
+    </div>
+    <div class="cam">
+      <video id="v2" playsinline muted></video>
+      <div class="reticle"></div>
+      <div class="flash" id="f2"></div>
+    </div>
+    <div id="runVerdict" class="verdict hidden">
+      <div class="big" id="runBig"></div>
+      <div class="msg" id="runMsg"></div>
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="sm" id="btnUndo">1つ戻す</button>
+      <button class="sm" id="btnSetCount">並べた数を入力</button>
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <button class="sm on" id="btnFinish">照合して終了</button>
+      <button class="sm quiet" id="btnRunBack">対象選択へ戻る</button>
+    </div>
+    <div class="card">
+      <label class="lbl">読み取り履歴</label>
+      <div class="log" id="runLog"></div>
+    </div>
+    <div class="card">
+      <label class="lbl">印字切れの判定（現場に合わせて調整）</label>
+      <div class="row">
+        <button class="sm" id="btnSensDown">ゆるく</button>
+        <button class="sm" id="btnSensUp">厳しく</button>
+      </div>
+      <p class="note" id="sensNote"></p>
+    </div>
+  </section>
+
+</div>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+/* =======================================================================
+   設定：GAS のウェブアプリ URL をここに貼る
+   ======================================================================= */
+var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
+
+var VERSION = 'v1.0';
+document.getElementById('verTag').textContent = VERSION;
+
+/* ================= 状態 ================= */
+var ITEMS = [];          // 製造データ全件
+var TARGET = null;       // 選択中の商品
+var MODE = null;         // 'one' | 'run'
+var reader = null;       // ZXing
+var stream = null;
+var scanning = false;
+
+var okCount = 0, ngCount = 0, setCount = null;
+var logRows = [];
+var lastCode = '', lastHitAt = 0, lastMissAt = 0;
+var GAP_MS = 700;        // 同一個体とみなす間隔
+var missWindow = 1400;   // ラベルは見えるのに読めない時間（印字切れ判定）
+var presentSince = 0;    // ラベルらしきものが視野に入った時刻
+var warnedAt = 0;
+
+/* ================= 小物 ================= */
+function $(id){ return document.getElementById(id); }
+function show(id, on){ $(id).classList.toggle('hidden', !on); }
+function banner(msg, kind){
+  var b = $('banner');
+  if(!msg){ b.classList.add('hidden'); return; }
+  b.className = 'banner ' + (kind || 'err');
+  b.textContent = msg;
+  b.classList.remove('hidden');
+}
+function fmtDate(s){
+  if(!s) return '—';
+  var p = s.split('-');
+  return p[0] + '/' + Number(p[1]) + '/' + Number(p[2]);
+}
+function nowHM(){
+  var d = new Date();
+  return ('0'+d.getHours()).slice(-2) + ':' + ('0'+d.getMinutes()).slice(-2) + ':' + ('0'+d.getSeconds()).slice(-2);
+}
+
+/* ---- 音（iPhoneはバイブが使えないので音を主にする） ---- */
+var actx = null;
+function beep(kind){
+  try{
+    if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if(actx.state === 'suspended') actx.resume();
+    var seq = kind === 'ok' ? [[880,.08]]
+            : kind === 'ng' ? [[300,.16],[240,.22]]
+            : [[520,.06]];
+        var t = actx.currentTime;
+    for(var i=0;i<seq.length;i++){
+      var o = actx.createOscillator(), g = actx.createGain();
+      o.type = 'square';
+      o.frequency.value = seq[i][0];
+      g.gain.value = .0001;
+      o.connect(g); g.connect(actx.destination);
+      o.start(t);
+      g.gain.exponentialRampToValueAtTime(.28, t + .01);
+      g.gain.exponentialRampToValueAtTime(.0001, t + seq[i][1]);
+      o.stop(t + seq[i][1] + .02);
+      t += seq[i][1] + .04;
+    }
+  }catch(e){}
+  try{ if(navigator.vibrate) navigator.vibrate(kind === 'ng' ? [90,60,90] : 40); }catch(e){}
+}
+function flash(id, kind){
+  var el = $(id);
+  el.className = 'flash ' + kind;
+  setTimeout(function(){ el.className = 'flash'; }, 220);
+}
+
+/* ---- JAN13 チェックデジット ---- */
+function janValid(code){
+  if(!/^\d{13}$/.test(code)) return /^\d{8}$/.test(code) ? jan8Valid(code) : false;
+  var s = 0;
+  for(var i=0;i<12;i++) s += Number(code[i]) * (i % 2 ? 3 : 1);
+  return (10 - (s % 10)) % 10 === Number(code[12]);
+}
+function jan8Valid(code){
+  var s = 0;
+  for(var i=0;i<7;i++) s += Number(code[i]) * (i % 2 ? 1 : 3);
+  return (10 - (s % 10)) % 10 === Number(code[7]);
+}
+
+/* ================= データ読み込み（JSONP） ================= */
+function fetchItems(){
+  return new Promise(function(res, rej){
+    if(!API_URL || API_URL.indexOf('http') !== 0){
+      rej(new Error('API_URL が設定されていません。index.html の API_URL に GAS の URL を貼ってください。'));
+      return;
+    }
+    var cb = 'cb_' + Date.now();
+    var s = document.createElement('script');
+    var done = false;
+    window[cb] = function(data){
+      done = true;
+      delete window[cb];
+      s.remove();
+      if(data && data.ok) res(data.items || []);
+      else rej(new Error(data && data.message || 'データを取得できませんでした。'));
+    };
+    s.onerror = function(){
+      if(done) return;
+      s.remove();
+      rej(new Error('通信に失敗しました。GASのデプロイ設定（アクセスできるユーザー＝全員）を確認してください。'));
+    };
+    s.src = API_URL + (API_URL.indexOf('?') < 0 ? '?' : '&') + 'callback=' + cb + '&t=' + Date.now();
+    document.body.appendChild(s);
+    setTimeout(function(){
+      if(!done){ try{ s.remove(); }catch(e){} rej(new Error('応答がありません。通信環境を確認してください。')); }
+    }, 15000);
+  });
+}
+
+function loadData(){
+  banner('製造データを読み込み中…', 'info');
+  return fetchItems().then(function(items){
+    ITEMS = items;
+    try{ localStorage.setItem('items_cache', JSON.stringify(items)); }catch(e){}
+    banner('');
+    buildDateOptions();
+  }).catch(function(e){
+    var cached = null;
+    try{ cached = JSON.parse(localStorage.getItem('items_cache') || 'null'); }catch(_){}
+    if(cached && cached.length){
+      ITEMS = cached;
+      banner('最新データを取得できないため、前回読み込んだデータで表示しています。 / ' + e.message, 'info');
+      buildDateOptions();
+    } else {
+      banner(e.message);
+    }
+  });
+}
+
+function buildDateOptions(){
+  var dates = [];
+  for(var i=0;i<ITEMS.length;i++){
+    if(dates.indexOf(ITEMS[i].date) < 0) dates.push(ITEMS[i].date);
+  }
+  dates.sort();
+  var today = new Date();
+  var td = today.getFullYear() + '-' + ('0'+(today.getMonth()+1)).slice(-2) + '-' + ('0'+today.getDate()).slice(-2);
+  var html = '';
+  for(var j=0;j<dates.length;j++){
+    html += '<option value="' + dates[j] + '"' + (dates[j] === td ? ' selected' : '') + '>'
+          + fmtDate(dates[j]) + (dates[j] === td ? '（本日）' : '') + '</option>';
+  }
+  $('selDate').innerHTML = html || '<option value="">データがありません</option>';
+  if(dates.indexOf(td) < 0 && dates.length){
+    banner('本日（' + fmtDate(td) + '）の製造データがありません。日付を選び直すか、シートに貼り付けてください。', 'info');
+  }
+  buildItemOptions();
+}
+
+function buildItemOptions(){
+  var d = $('selDate').value;
+  var list = ITEMS.filter(function(x){ return x.date === d; });
+  // 同一商品・同一JANの行は1件にまとめる（原本は同じ内容が複数行に分かれる）
+  var seen = {}, uniq = [];
+  for(var i=0;i<list.length;i++){
+    var k = list[i].name + '|' + list[i].jan5 + '|' + list[i].frozen + '|' + list[i].chilled;
+    if(seen[k]) { seen[k].shiji += list[i].shiji; continue; }
+    var copy = JSON.parse(JSON.stringify(list[i]));
+    seen[k] = copy;
+    uniq.push(copy);
+  }
+  var html = '';
+  for(var j=0;j<uniq.length;j++){
+    html += '<option value="' + j + '">' + uniq[j].name + '（' + uniq[j].jan5 + '）</option>';
+  }
+  $('selItem').innerHTML = html || '<option value="">この日の商品がありません</option>';
+  $('selItem').dataset.list = JSON.stringify(uniq);
+  pickItem();
+}
+
+function pickItem(){
+  var list = [];
+  try{ list = JSON.parse($('selItem').dataset.list || '[]'); }catch(e){}
+  TARGET = list[Number($('selItem').value)] || null;
+  $('targetBox').innerHTML = TARGET ? targetHTML(TARGET) : '';
+  var can = !!(TARGET && TARGET.jan5);
+  $('btnMode1').disabled = !can;
+  $('btnMode2').disabled = !can;
+  if(TARGET && !TARGET.jan5){
+    banner('この商品はJANコード下5桁が空欄です。シートを確認してください。', 'info');
+  }
+}
+
+function targetHTML(t){
+  var kigen = t.frozen || t.chilled;
+  var kigenLabel = t.frozen ? '賞味期限 冷凍' : (t.chilled ? '賞味期限 冷蔵' : '賞味期限');
+  var h = '<div class="target"><div class="nm">' + esc(t.name) + '</div>'
+        + '<div class="kv"><span class="k">JAN下5桁</span><span class="v">' + esc(t.jan5 || '—') + '</span></div>'
+        + '<div class="kv"><span class="k">' + kigenLabel + '</span><span class="v">' + fmtDate(kigen) + '</span></div>';
+  if(t.frozen && t.chilled){
+    h += '<div class="kv"><span class="k">賞味期限 冷蔵</span><span class="v small">' + fmtDate(t.chilled) + '</span></div>';
+  }
+  if(t.note) h += '<div class="kv"><span class="k">注意事項</span><span class="v small">' + esc(t.note) + '</span></div>';
+  if(t.shiji) h += '<div class="kv"><span class="k">製造指示数</span><span class="v small">' + t.shiji + ' P</span></div>';
+  h += '</div>';
+  return h;
+}
+function esc(s){
+  return String(s).replace(/[&<>"]/g, function(c){
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c];
+  });
+}
+
+/* ================= カメラ ================= */
+function startCamera(videoId){
+  var v = $(videoId);
+  return navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1920 },
+      height: { ideal: 1080 }
+    },
+    audio: false
+  }).then(function(st){
+    stream = st;
+    v.srcObject = st;
+    v.setAttribute('playsinline', '');
+    return v.play();
+  });
+}
+function stopCamera(){
+  scanning = false;
+  try{ if(reader) reader.reset(); }catch(e){}
+  if(stream){
+    stream.getTracks().forEach(function(t){ t.stop(); });
+    stream = null;
+  }
+}
+
+function makeReader(){
+  var hints = new Map();
+  var fmts = [
+    ZXing.BarcodeFormat.EAN_13,
+    ZXing.BarcodeFormat.EAN_8,
+    ZXing.BarcodeFormat.UPC_A
+  ];
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, fmts);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  return new ZXing.BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 80 });
+}
+
+/* ラベルらしき明るい面が枠内にあるか（印字切れ判定の前提） */
+var probe = document.createElement('canvas');
+function labelPresent(video){
+  try{
+    var vw = video.videoWidth, vh = video.videoHeight;
+    if(!vw) return false;
+    var w = 64, h = 40;
+    probe.width = w; probe.height = h;
+    var ctx = probe.getContext('2d');
+    ctx.drawImage(video, vw*0.08, vh*0.28, vw*0.84, vh*0.44, 0, 0, w, h);
+    var d = ctx.getImageData(0,0,w,h).data;
+    var sum = 0, n = w*h, vals = new Array(n);
+    for(var i=0,j=0;j<n;i+=4,j++){
+      var g = (d[i]*299 + d[i+1]*587 + d[i+2]*114)/1000;
+      vals[j] = g; sum += g;
+    }
+    var mean = sum/n, varsum = 0;
+    for(var k=0;k<n;k++){ var t = vals[k]-mean; varsum += t*t; }
+    var sd = Math.sqrt(varsum/n);
+    // 明るい面（ラベル）があり、かつ模様（印字）があるとき
+    return mean > 90 && sd > 18;
+  }catch(e){ return false; }
+}
+
+/* ================= ① ラベル確認 ================= */
+function enterOne(){
+  MODE = 'one';
+  show('pane-select', false); show('pane-run', false); show('pane-one', true);
+  $('oneTarget').innerHTML = targetHTML(TARGET);
+  show('oneVerdict', false);
+  window.scrollTo(0,0);
+  reader = makeReader();
+  startCamera('v1').then(function(){
+    scanning = true;
+    reader.decodeFromVideoElement($('v1'), function(result, err){
+      if(!scanning || !result) return;
+      scanning = false;
+      onOneRead(result.getText());
+    });
+  }).catch(camError);
+}
+
+function onOneRead(code){
+  var last5 = code.slice(-5);
+  var okJan = TARGET.jan5 && last5 === TARGET.jan5;
+  var cd = janValid(code);
+  var v = $('oneVerdict');
+  show('oneVerdict', true);
+  if(okJan && cd){
+    v.className = 'verdict ok';
+    $('oneBig').textContent = '商品OK';
+    $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）<br>'
+      + '賞味期限は上の表示と現物の印字を見比べてください。';
+    beep('ok'); flash('f1','ok');
+  } else {
+    v.className = 'verdict ng';
+    $('oneBig').textContent = okJan ? '要確認' : '商品ちがい';
+    $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）<br>'
+      + (okJan ? 'チェックデジットが合いません。読み取り不良か、正規のJANでない可能性があります。'
+               : '指定した商品のJAN下5桁「' + TARGET.jan5 + '」と一致しません。ラベルを確認してください。');
+    beep('ng'); flash('f1','ng');
+  }
+}
+
+/* ================= ② 流しで確認 ================= */
+function enterRun(){
+  MODE = 'run';
+  show('pane-select', false); show('pane-one', false); show('pane-run', true);
+  $('runTarget').innerHTML = targetHTML(TARGET);
+  okCount = 0; ngCount = 0; setCount = null; logRows = [];
+  lastCode = ''; lastHitAt = 0; presentSince = 0; warnedAt = 0;
+  renderCounts(); renderLog(); renderSens();
+  show('runVerdict', false);
+  window.scrollTo(0,0);
+  reader = makeReader();
+  startCamera('v2').then(function(){
+    scanning = true;
+    reader.decodeFromVideoElement($('v2'), function(result, err){
+      if(!scanning) return;
+      if(result) onRunHit(result.getText());
+      else onRunMiss();
+    });
+  }).catch(camError);
+}
+
+function onRunHit(code){
+  var t = Date.now();
+  presentSince = 0;                       // 読めたので「読めない状態」をリセット
+  if(code === lastCode && t - lastHitAt < GAP_MS){
+    lastHitAt = t;
+    return;                               // 同一個体を連続で数えない
+  }
+  lastCode = code; lastHitAt = t;
+
+  var last5 = code.slice(-5);
+  var okJan = TARGET.jan5 && last5 === TARGET.jan5 && janValid(code);
+  if(okJan){
+    okCount++;
+    pushLog('OK', last5, 'ok');
+    beep('ok'); flash('f2','ok');
+    setVerdict('ok', 'OK ' + okCount, '下5桁 ' + last5);
+  } else {
+    ngCount++;
+    pushLog('商品ちがい ' + last5, last5, 'ng');
+    beep('ng'); flash('f2','ng');
+    setVerdict('ng', '商品ちがい', '読み取り ' + code + ' / 指定 ' + TARGET.jan5 + '。手を止めて現品を確認してください。');
+  }
+  renderCounts();
+}
+
+function onRunMiss(){
+  var t = Date.now();
+  if(t - lastHitAt < 350) return;                   // 直後は無視
+  if(!labelPresent($('v2'))){ presentSince = 0; return; }
+  if(!presentSince){ presentSince = t; return; }
+  if(t - presentSince < missWindow) return;
+  if(t - warnedAt < 1500) return;                   // 鳴り続けを防ぐ
+  warnedAt = t;
+  presentSince = 0;
+  ngCount++;
+  pushLog('読めません（印字切れの疑い）', '', 'ng');
+  beep('ng'); flash('f2','ng');
+  setVerdict('ng', '読めません', 'ラベルは見えていますがバーコードを読み取れません。印字切れの疑いがあります。手を止めて現品を確認してください。');
+  renderCounts();
+}
+
+function setVerdict(kind, big, msg){
+  var v = $('runVerdict');
+  v.className = 'verdict ' + kind;
+  $('runBig').textContent = big;
+  $('runMsg').textContent = msg;
+  show('runVerdict', true);
+}
+function pushLog(text, code, kind){
+  logRows.unshift({ t: nowHM(), text: text, kind: kind });
+  if(logRows.length > 200) logRows.pop();
+  renderLog();
+}
+function renderLog(){
+  var h = '';
+  for(var i=0;i<logRows.length;i++){
+    h += '<div><span class="t">' + logRows[i].t + '</span>'
+       + '<span class="r ' + logRows[i].kind + '">' + esc(logRows[i].text) + '</span></div>';
+  }
+  $('runLog').innerHTML = h || '<div class="note">まだ読み取りがありません。</div>';
+}
+function renderCounts(){
+  $('cOk').textContent = okCount;
+  $('cNg').textContent = ngCount;
+  $('cSet').textContent = setCount === null ? '—' : setCount;
+}
+function renderSens(){
+  $('sensNote').textContent =
+    '「読めない」と判断するまでの時間：' + (missWindow/1000).toFixed(1) + '秒。'
+    + 'スライドが速くて誤って鳴るときは「ゆるく」、印字切れを見逃すときは「厳しく」してください。';
+}
+
+function undo(){
+  if(!logRows.length) return;
+  var r = logRows.shift();
+  if(r.kind === 'ok' && okCount > 0) okCount--;
+  if(r.kind === 'ng' && ngCount > 0) ngCount--;
+  lastCode = '';
+  renderCounts(); renderLog();
+  beep('tick');
+}
+
+function finish(){
+  var msg = 'OK ' + okCount + '個 / 要確認 ' + ngCount + '個';
+  if(setCount !== null){
+    var diff = setCount - okCount - ngCount;
+    if(diff > 0){
+      setVerdict('ng', '数が足りません',
+        msg + '。並べた数 ' + setCount + ' に対して ' + diff + '個が読み取られていません。'
+        + 'かざし漏れか、読めなかった個体があります。もう一度流してください。');
+      beep('ng');
+      return;
+    }
+    if(diff < 0){
+      setVerdict('ng', '数が多い',
+        msg + '。並べた数 ' + setCount + ' より ' + (-diff) + '個多く読み取っています。二重カウントの可能性があります。');
+      beep('ng');
+      return;
+    }
+  }
+  if(ngCount > 0){
+    setVerdict('ng', '要確認 ' + ngCount + '個', msg + '。履歴を見て該当個体を確認してください。');
+    beep('ng');
+  } else {
+    setVerdict('ok', '全数OK', msg + (setCount !== null ? '（並べた数 ' + setCount + ' と一致）' : ''));
+    beep('ok');
+  }
+}
+
+function camError(e){
+  var m = String(e && e.name || e);
+  var msg = 'カメラを起動できませんでした。';
+  if(m.indexOf('NotAllowed') >= 0) msg += 'カメラの使用を許可してください（設定→Safari→カメラ）。';
+  else if(location.protocol !== 'https:' && location.hostname !== 'localhost') msg += 'HTTPS でないとカメラは使えません。';
+  else msg += m;
+  banner(msg);
+  backToSelect();
+}
+
+function backToSelect(){
+  stopCamera();
+  MODE = null;
+  show('pane-one', false); show('pane-run', false); show('pane-select', true);
+  window.scrollTo(0,0);
+}
+
+/* ================= イベント ================= */
+$('selDate').addEventListener('change', buildItemOptions);
+$('selItem').addEventListener('change', pickItem);
+$('btnReload').addEventListener('click', function(){ loadData(); });
+$('btnMode1').addEventListener('click', function(){ if(TARGET) enterOne(); });
+$('btnMode2').addEventListener('click', function(){ if(TARGET) enterRun(); });
+$('btnOneBack').addEventListener('click', backToSelect);
+$('btnRunBack').addEventListener('click', backToSelect);
+$('btnOneRetry').addEventListener('click', function(){
+  show('oneVerdict', false);
+  scanning = true;
+});
+$('btnUndo').addEventListener('click', undo);
+$('btnFinish').addEventListener('click', finish);
+$('btnSetCount').addEventListener('click', function(){
+  var s = window.prompt('バットに並べた数を入力してください', setCount === null ? '' : String(setCount));
+  if(s === null) return;
+  var n = parseInt(s, 10);
+  setCount = isFinite(n) && n > 0 ? n : null;
+  renderCounts();
+});
+$('btnSensUp').addEventListener('click', function(){
+  missWindow = Math.max(600, missWindow - 200); renderSens();
+});
+$('btnSensDown').addEventListener('click', function(){
+  missWindow = Math.min(3000, missWindow + 200); renderSens();
+});
+document.addEventListener('visibilitychange', function(){
+  if(document.hidden && MODE) stopCamera();
+});
+
+/* ================= 起動 ================= */
+(function init(){
+  if(!window.ZXing){
+    banner('バーコード読み取りライブラリを読み込めませんでした。通信環境を確認して開き直してください。');
+  }
+  loadData();
+})();
+</script>
+</body>
+</html>
