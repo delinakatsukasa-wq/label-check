@@ -62,11 +62,21 @@
 
   /* カメラ */
   .cam{position:relative; background:#000; border-radius:10px; overflow:hidden; margin-bottom:10px;}
-  .cam video{width:100%; display:block; max-height:46vh; object-fit:cover;}
+  .cam video{width:100%; display:block; max-height:56vh; object-fit:contain; background:#000;}
   .reticle{
-    position:absolute; left:8%; right:8%; top:28%; bottom:28%;
-    border:2px solid rgba(255,195,0,.85); border-radius:6px; pointer-events:none;
+    position:absolute; left:4%; right:4%; top:8%; bottom:8%;
+    border:2px solid rgba(255,195,0,.7); border-radius:6px; pointer-events:none;
   }
+  /* 読み取り時の静止画と、期限の並べ比べ */
+  .shot{width:100%; border-radius:8px; display:block; background:#000;}
+  .cmp{display:flex; gap:10px; margin-top:10px;}
+  .cmp>div{
+    flex:1; background:var(--panel2); border:1px solid var(--line);
+    border-radius:8px; padding:10px; text-align:center;
+  }
+  .cmp .k{font-size:11px; color:var(--dim);}
+  .cmp .d{font-size:24px; font-weight:800; font-variant-numeric:tabular-nums; margin-top:2px;}
+  .zoomwrap{overflow:hidden; border-radius:8px; background:#000;}
   .flash{position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .12s;}
   .flash.ok{background:rgba(46,208,122,.5); opacity:1;}
   .flash.ng{background:rgba(255,76,59,.55); opacity:1;}
@@ -99,6 +109,7 @@
   <h1>ラベル照合 <span class="sub" id="verTag"></span></h1>
 
   <div id="banner" class="banner err hidden"></div>
+  <div id="engine" class="banner info" style="font-size:12px;">読み取り機能を準備中…</div>
 
   <!-- ========== 対象選択 ========== -->
   <section id="pane-select">
@@ -136,6 +147,18 @@
       <div class="big" id="oneBig"></div>
       <div class="msg" id="oneMsg"></div>
     </div>
+    <div class="card hidden" id="shotCard">
+      <label class="lbl">読み取った瞬間の画像（賞味期限を見比べてください）</label>
+      <div class="zoomwrap"><img id="shotImg" class="shot" alt=""></div>
+      <div class="cmp">
+        <div><div class="k">製造データ</div><div class="d" id="cmpData">—</div></div>
+        <div><div class="k">ラベルの印字</div><div class="d" style="color:var(--amber)">目視</div></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button class="sm on" id="btnKigenOk">期限も一致</button>
+        <button class="sm" id="btnKigenNg">期限がちがう</button>
+      </div>
+    </div>
     <div class="card">
       <p class="note" id="oneHint">バーコードを枠の中に入れてください。読み取ると自動で照合します。</p>
     </div>
@@ -143,6 +166,15 @@
       <button class="sm" id="btnOneRetry">もう一度読む</button>
       <button class="sm quiet" id="btnOneBack">対象選択へ戻る</button>
     </div>
+    <div class="card">
+      <button class="sm wide" id="btnPhoto">写真から読む</button>
+      <p class="note" style="margin-top:8px;">
+        保存済みの写真ファイルを直接解析します。パソコンやスマホの画面に映したバーコードをカメラで撮っても、
+        画面の反射とギザつきでほぼ読めません。検証するときはこちらを使ってください。
+      </p>
+      <img id="photoPrev" class="hidden" style="width:100%; max-width:320px; border-radius:6px; margin-top:10px;" alt="">
+    </div>
+    <input type="file" id="photoFile" accept="image/*" style="display:none">
   </section>
 
   <!-- ========== ② 流しで確認 ========== -->
@@ -186,14 +218,13 @@
 
 </div>
 
-<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script>
 /* =======================================================================
    設定：GAS のウェブアプリ URL をここに貼る
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v1.0';
+var VERSION = 'v1.3';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -372,7 +403,7 @@ function pickItem(){
   try{ list = JSON.parse($('selItem').dataset.list || '[]'); }catch(e){}
   TARGET = list[Number($('selItem').value)] || null;
   $('targetBox').innerHTML = TARGET ? targetHTML(TARGET) : '';
-  var can = !!(TARGET && TARGET.jan5);
+  var can = !!(TARGET && TARGET.jan5) && !!ENGINE;
   $('btnMode1').disabled = !can;
   $('btnMode2').disabled = !can;
   if(TARGET && !TARGET.jan5){
@@ -419,11 +450,113 @@ function startCamera(videoId){
 }
 function stopCamera(){
   scanning = false;
+  stopNativeScan();
   try{ if(reader) reader.reset(); }catch(e){}
   if(stream){
     stream.getTracks().forEach(function(t){ t.stop(); });
     stream = null;
   }
+}
+
+
+/* ================= 読み取りエンジンの準備 =================
+   ZXing の配信元を順に試す。どれか1つ読めれば動く。
+   iPhone 以外では標準の BarcodeDetector があればそちらを優先する。      */
+var ENGINE = '';          // 'native' | 'zxing' | ''
+var ZX_SOURCES = [
+  'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js',
+  'https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/zxing-library/0.21.3/umd/index.min.js'
+];
+
+function setEngineMsg(txt, kind){
+  var el = $('engine');
+  el.className = 'banner ' + (kind || 'info');
+  el.style.fontSize = '12px';
+  el.textContent = txt;
+}
+
+function loadScript(src){
+  return new Promise(function(res, rej){
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload = function(){ res(src); };
+    s.onerror = function(){ s.remove(); rej(new Error(src)); };
+    setTimeout(function(){ if(!window.ZXing) rej(new Error('timeout ' + src)); }, 12000);
+    document.head.appendChild(s);
+  });
+}
+
+function loadZXing(){
+  var i = 0;
+  function next(){
+    if(window.ZXing) return Promise.resolve('loaded');
+    if(i >= ZX_SOURCES.length) return Promise.reject(new Error('all failed'));
+    return loadScript(ZX_SOURCES[i++]).then(function(){
+      return window.ZXing ? 'loaded' : next();
+    }).catch(next);
+  }
+  return next();
+}
+
+function prepareEngine(){
+  // 標準機能が使えるか（Android Chrome など）
+  if(window.BarcodeDetector){
+    return BarcodeDetector.getSupportedFormats().then(function(fmts){
+      if(fmts.indexOf('ean_13') >= 0){
+        ENGINE = 'native';
+        setEngineMsg('読み取り：端末の標準機能を使用', 'info');
+        return;
+      }
+      return loadZXing().then(function(){
+        ENGINE = 'zxing';
+        setEngineMsg('読み取り：ZXing を使用', 'info');
+      });
+    }).catch(function(){
+      return loadZXing().then(function(){
+        ENGINE = 'zxing';
+        setEngineMsg('読み取り：ZXing を使用', 'info');
+      });
+    });
+  }
+  return loadZXing().then(function(){
+    ENGINE = 'zxing';
+    setEngineMsg('読み取り：ZXing を使用', 'info');
+  });
+}
+
+/* ---- 標準機能用の連続読み取り ---- */
+var nativeDet = null, nativeTimer = null;
+function startNativeScan(videoId, onHit, onMiss){
+  if(!nativeDet) nativeDet = new BarcodeDetector({ formats: ['ean_13','ean_8','upc_a'] });
+  var v = $(videoId);
+  var busy = false;
+  nativeTimer = setInterval(function(){
+    if(!scanning || busy || !v.videoWidth) return;
+    busy = true;
+    nativeDet.detect(v).then(function(codes){
+      busy = false;
+      if(codes && codes.length) onHit(codes[0].rawValue);
+      else if(onMiss) onMiss();
+    }).catch(function(){ busy = false; if(onMiss) onMiss(); });
+  }, 150);
+}
+function stopNativeScan(){
+  if(nativeTimer){ clearInterval(nativeTimer); nativeTimer = null; }
+}
+
+/* ---- モードに応じて読み取りを開始する共通入口 ---- */
+function startScan(videoId, onHit, onMiss){
+  if(ENGINE === 'native'){
+    startNativeScan(videoId, onHit, onMiss);
+    return;
+  }
+  reader = makeReader();
+  reader.decodeFromVideoElement($(videoId), function(result, err){
+    if(!scanning) return;
+    if(result) onHit(result.getText());
+    else if(onMiss) onMiss();
+  });
 }
 
 function makeReader(){
@@ -468,19 +601,42 @@ function enterOne(){
   show('pane-select', false); show('pane-run', false); show('pane-one', true);
   $('oneTarget').innerHTML = targetHTML(TARGET);
   show('oneVerdict', false);
+  show('shotCard', false);
   window.scrollTo(0,0);
-  reader = makeReader();
   startCamera('v1').then(function(){
     scanning = true;
-    reader.decodeFromVideoElement($('v1'), function(result, err){
-      if(!scanning || !result) return;
+    startScan('v1', function(code){
+      if(!scanning) return;
       scanning = false;
-      onOneRead(result.getText());
+      onOneRead(code);
     });
   }).catch(camError);
 }
 
-function onOneRead(code){
+/* 読み取った瞬間のカメラ画像を静止画として残す */
+function grabFrame(videoId){
+  try{
+    var v = $(videoId);
+    if(!v || !v.videoWidth) return '';
+    var cv = document.createElement('canvas');
+    var maxW = 1280;
+    var s = Math.min(1, maxW / v.videoWidth);
+    cv.width = Math.round(v.videoWidth * s);
+    cv.height = Math.round(v.videoHeight * s);
+    cv.getContext('2d').drawImage(v, 0, 0, cv.width, cv.height);
+    return cv.toDataURL('image/jpeg', 0.9);
+  }catch(e){ return ''; }
+}
+
+function showShot(dataURL){
+  if(!dataURL){ show('shotCard', false); return; }
+  $('shotImg').src = dataURL;
+  $('cmpData').textContent = TARGET ? fmtDate(TARGET.frozen || TARGET.chilled) : '—';
+  show('shotCard', true);
+}
+
+function onOneRead(code, shot){
+  showShot(shot !== undefined ? shot : grabFrame('v1'));
   var last5 = code.slice(-5);
   var okJan = TARGET.jan5 && last5 === TARGET.jan5;
   var cd = janValid(code);
@@ -512,14 +668,9 @@ function enterRun(){
   renderCounts(); renderLog(); renderSens();
   show('runVerdict', false);
   window.scrollTo(0,0);
-  reader = makeReader();
   startCamera('v2').then(function(){
     scanning = true;
-    reader.decodeFromVideoElement($('v2'), function(result, err){
-      if(!scanning) return;
-      if(result) onRunHit(result.getText());
-      else onRunMiss();
-    });
+    startScan('v2', onRunHit, onRunMiss);
   }).catch(camError);
 }
 
@@ -656,9 +807,99 @@ $('btnReload').addEventListener('click', function(){ loadData(); });
 $('btnMode1').addEventListener('click', function(){ if(TARGET) enterOne(); });
 $('btnMode2').addEventListener('click', function(){ if(TARGET) enterRun(); });
 $('btnOneBack').addEventListener('click', backToSelect);
+$('btnKigenOk').addEventListener('click', function(){
+  var v = $('oneVerdict');
+  if(v.className.indexOf('ng') >= 0) return;   // 商品が違う時は期限OKにできない
+  $('oneBig').textContent = '確認ずみ';
+  $('oneMsg').innerHTML = 'JANと賞味期限の両方を確認しました。';
+  beep('ok');
+});
+$('btnKigenNg').addEventListener('click', function(){
+  var v = $('oneVerdict');
+  v.className = 'verdict ng';
+  $('oneBig').textContent = '期限ちがい';
+  $('oneMsg').innerHTML = '製造データの賞味期限（' + (TARGET ? fmtDate(TARGET.frozen || TARGET.chilled) : '—')
+    + '）と印字が一致していません。ラベルの設定を確認してください。';
+  beep('ng');
+});
+$('btnPhoto').addEventListener('click', function(){ $('photoFile').click(); });
+$('photoFile').addEventListener('change', function(e){
+  var f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if(!f) return;
+  readFromPhoto(f);
+});
+
+/* 写真ファイルからバーコードを読む（画面越し撮影より確実） */
+function readFromPhoto(file){
+  var url = URL.createObjectURL(file);
+  $('photoPrev').src = url;
+  $('photoPrev').classList.remove('hidden');
+  $('oneHint').textContent = '写真を解析中…';
+
+  var img = new Image();
+  img.onload = function(){
+    if(ENGINE === 'native'){
+      var det = new BarcodeDetector({ formats: ['ean_13','ean_8','upc_a'] });
+      det.detect(img).then(function(codes){
+        if(codes && codes.length){
+          $('oneHint').textContent = '写真から読み取りました。';
+          var c = document.createElement('canvas');
+          c.width = img.naturalWidth; c.height = img.naturalHeight;
+          c.getContext('2d').drawImage(img, 0, 0);
+          onOneRead(codes[0].rawValue, c.toDataURL('image/jpeg', .9));
+        } else {
+          $('oneHint').textContent = 'この写真からバーコードを検出できませんでした。';
+          beep('ng');
+        }
+        URL.revokeObjectURL(url);
+      }).catch(function(){
+        $('oneHint').textContent = 'この写真からバーコードを検出できませんでした。';
+        URL.revokeObjectURL(url);
+      });
+      return;
+    }
+    if(!window.ZXing){
+      $('oneHint').textContent = '読み取り機能が読み込めていません。通信環境を確認して開き直してください。';
+      return;
+    }
+    var r = new ZXing.BrowserMultiFormatReader();
+    // 元の大きさと拡大版の2通りで試す（小さく写っている場合の対策）
+    var tries = [1, 2];
+    var i = 0;
+    (function next(){
+      if(i >= tries.length){
+        URL.revokeObjectURL(url);
+        $('oneHint').textContent = 'この写真からバーコードを検出できませんでした。'
+          + 'バーコードが大きく、ピントが合って写っているものを選んでください。';
+        show('oneVerdict', false);
+        beep('ng');
+        return;
+      }
+      var scale = tries[i++];
+      var cv = document.createElement('canvas');
+      cv.width = img.naturalWidth * scale;
+      cv.height = img.naturalHeight * scale;
+      var ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0, cv.width, cv.height);
+      r.decodeFromCanvas(cv).then(function(result){
+        URL.revokeObjectURL(url);
+        $('oneHint').textContent = '写真から読み取りました。';
+        onOneRead(result.getText(), cv.toDataURL('image/jpeg', 0.9));
+      }).catch(function(){ next(); });
+    })();
+  };
+  img.onerror = function(){
+    URL.revokeObjectURL(url);
+    $('oneHint').textContent = '画像を読み込めませんでした。';
+  };
+  img.src = url;
+}
 $('btnRunBack').addEventListener('click', backToSelect);
 $('btnOneRetry').addEventListener('click', function(){
   show('oneVerdict', false);
+  show('shotCard', false);
   scanning = true;
 });
 $('btnUndo').addEventListener('click', undo);
@@ -682,9 +923,14 @@ document.addEventListener('visibilitychange', function(){
 
 /* ================= 起動 ================= */
 (function init(){
-  if(!window.ZXing){
-    banner('バーコード読み取りライブラリを読み込めませんでした。通信環境を確認して開き直してください。');
-  }
+  $('btnMode1').disabled = true;
+  $('btnMode2').disabled = true;
+  prepareEngine().then(function(){
+    pickItem();   // 商品が選べていればボタンを有効化
+  }).catch(function(){
+    setEngineMsg('読み取り機能を読み込めませんでした。社内ネットワークで外部サイトが遮断されている可能性があります。'
+      + '通信環境を変えて開き直してください。', 'err');
+  });
   loadData();
 })();
 </script>
