@@ -162,6 +162,11 @@
     <div class="card">
       <p class="note" id="oneHint">バーコードを枠の中に入れてください。読み取ると自動で照合します。</p>
     </div>
+    <div class="card">
+      <label class="lbl">動作状況（うまくいかないときはこの内容を伝えてください）</label>
+      <div class="dbgbox" style="font-size:12px; color:var(--dim); font-family:ui-monospace,monospace; white-space:pre-wrap; line-height:1.6;">—</div>
+    </div>
+
     <div class="row" style="margin-bottom:10px;">
       <button class="sm" id="btnOneRetry">もう一度読む</button>
       <button class="sm quiet" id="btnOneBack">対象選択へ戻る</button>
@@ -203,6 +208,10 @@
       <button class="sm quiet" id="btnRunBack">対象選択へ戻る</button>
     </div>
     <div class="card">
+      <label class="lbl">動作状況（うまくいかないときはこの内容を伝えてください）</label>
+      <div class="dbgbox" style="font-size:12px; color:var(--dim); font-family:ui-monospace,monospace; white-space:pre-wrap; line-height:1.6;">—</div>
+    </div>
+    <div class="card">
       <label class="lbl">読み取り履歴</label>
       <div class="log" id="runLog"></div>
     </div>
@@ -224,7 +233,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v1.3';
+var VERSION = 'v1.4';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -437,8 +446,9 @@ function startCamera(videoId){
   return navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: { ideal: 'environment' },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 }
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      focusMode: 'continuous'
     },
     audio: false
   }).then(function(st){
@@ -451,6 +461,7 @@ function startCamera(videoId){
 function stopCamera(){
   scanning = false;
   stopNativeScan();
+  stopScanTimer();
   try{ if(reader) reader.reset(); }catch(e){}
   if(stream){
     stream.getTracks().forEach(function(t){ t.stop(); });
@@ -545,18 +556,79 @@ function stopNativeScan(){
   if(nativeTimer){ clearInterval(nativeTimer); nativeTimer = null; }
 }
 
+
+/* ================= 動作状況の表示 ================= */
+var DIAG = { tries:0, hits:0, lastErr:'', started:false, vw:0, vh:0, note:'' };
+function dbg(){
+  var els = document.querySelectorAll('.dbgbox');
+  if(!els.length) return;
+  var lines = [
+    'エンジン: ' + (ENGINE || '未準備'),
+    'カメラ: ' + (DIAG.started ? '起動中 ' + DIAG.vw + '×' + DIAG.vh : '未起動'),
+    '読み取り試行: ' + DIAG.tries + ' 回',
+    '検出成功: ' + DIAG.hits + ' 回',
+    'ZXing読込: ' + (window.ZXing ? 'OK' : '未'),
+    DIAG.note ? ('メモ: ' + DIAG.note) : '',
+    DIAG.lastErr ? ('直近のエラー: ' + DIAG.lastErr) : ''
+  ];
+  var txt = lines.filter(function(x){ return x; }).join('\n');
+  for(var i=0;i<els.length;i++) els[i].textContent = txt;
+}
+setInterval(function(){
+  var v = $('v1').videoWidth ? $('v1') : $('v2');
+  if(v && v.videoWidth){ DIAG.started = true; DIAG.vw = v.videoWidth; DIAG.vh = v.videoHeight; }
+  dbg();
+}, 500);
+
 /* ---- モードに応じて読み取りを開始する共通入口 ---- */
+var scanTimer = null;
+var scanCv = document.createElement('canvas');
+
 function startScan(videoId, onHit, onMiss){
   if(ENGINE === 'native'){
     startNativeScan(videoId, onHit, onMiss);
     return;
   }
-  reader = makeReader();
-  reader.decodeFromVideoElement($(videoId), function(result, err){
-    if(!scanning) return;
-    if(result) onHit(result.getText());
-    else if(onMiss) onMiss();
-  });
+  // ZXing に毎回こちらから画像を渡す方式。
+  // ライブラリ任せの自動ループが動かない端末があるため、自前で回す。
+  try{ reader = makeReader(); }
+  catch(e){ DIAG.lastErr = 'reader生成失敗 ' + e.message; dbg(); return; }
+
+  var v = $(videoId);
+  var busy = false;
+  scanTimer = setInterval(function(){
+    if(!scanning || busy || !v.videoWidth) return;
+    busy = true;
+    DIAG.tries++;
+    try{
+      // 中央の帯（ガイド枠のあたり）だけを切り出して渡す。背景を除くと精度が上がる。
+      var sw = v.videoWidth, sh = v.videoHeight;
+      var cx = sw * 0.04, cy = sh * 0.20, cw = sw * 0.92, chh = sh * 0.60;
+      var scale = Math.min(1, 1000 / cw);
+      scanCv.width = Math.round(cw * scale);
+      scanCv.height = Math.round(chh * scale);
+      var ctx = scanCv.getContext('2d');
+      ctx.drawImage(v, cx, cy, cw, chh, 0, 0, scanCv.width, scanCv.height);
+
+      reader.decodeFromCanvas(scanCv).then(function(result){
+        busy = false;
+        DIAG.hits++;
+        if(scanning) onHit(result.getText());
+      }).catch(function(err){
+        busy = false;
+        var n = String(err && err.name || '');
+        if(n && n !== 'NotFoundException') DIAG.lastErr = n;
+        if(onMiss) onMiss();
+      });
+    }catch(e){
+      busy = false;
+      DIAG.lastErr = e.message;
+    }
+  }, 200);
+}
+
+function stopScanTimer(){
+  if(scanTimer){ clearInterval(scanTimer); scanTimer = null; }
 }
 
 function makeReader(){
