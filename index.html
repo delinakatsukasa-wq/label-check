@@ -233,7 +233,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v1.4';
+var VERSION = 'v1.6';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -567,7 +567,7 @@ function dbg(){
     'カメラ: ' + (DIAG.started ? '起動中 ' + DIAG.vw + '×' + DIAG.vh : '未起動'),
     '読み取り試行: ' + DIAG.tries + ' 回',
     '検出成功: ' + DIAG.hits + ' 回',
-    'ZXing読込: ' + (window.ZXing ? 'OK' : '未'),
+    'ZXing読込: ' + (window.ZXing ? 'OK' : '未') + ' / 方式: ' + (DECODE_MODE || '判定中'),
     DIAG.note ? ('メモ: ' + DIAG.note) : '',
     DIAG.lastErr ? ('直近のエラー: ' + DIAG.lastErr) : ''
   ];
@@ -581,6 +581,55 @@ setInterval(function(){
 }, 500);
 
 /* ---- モードに応じて読み取りを開始する共通入口 ---- */
+
+/* ================= canvas から1枚デコードする =================
+   ZXing の低レベルAPIを直接使う。この経路は動作確認済み。
+   （BrowserMultiFormatReader には canvas を直接渡す関数が無い） */
+var coreReader = null, coreHints = null;
+
+function buildCoreReader(){
+  try{
+    coreHints = new Map();
+    coreHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A
+    ]);
+    coreHints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    coreReader = new ZXing.MultiFormatReader();
+    DECODE_MODE = 'core';
+    return true;
+  }catch(e){
+    DIAG.lastErr = 'デコーダ生成失敗 ' + e.message;
+    coreReader = null;
+    return false;
+  }
+}
+
+var DECODE_MODE = '';
+
+function decodeCanvasSync(cv){
+  if(!window.ZXing) return '';
+  if(!coreReader && !buildCoreReader()) return '';
+  try{
+    var lum = new ZXing.HTMLCanvasElementLuminanceSource(cv);
+    var bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
+    var res = coreReader.decode(bmp, coreHints);
+    return res ? res.getText() : '';
+  }catch(e){
+    var m = String(e && e.message || '');
+    // 「見つからない／チェック不一致」は今は写っていないだけなので記録しない
+    var normal = m.indexOf('able to detect') >= 0
+              || m.indexOf('Checksum') >= 0
+              || m.indexOf('Format') >= 0
+              || m === '';
+    if(!normal) DIAG.lastErr = m;
+    return '';
+  }finally{
+    try{ coreReader.reset(); }catch(e2){}
+  }
+}
+
 var scanTimer = null;
 var scanCv = document.createElement('canvas');
 
@@ -591,8 +640,7 @@ function startScan(videoId, onHit, onMiss){
   }
   // ZXing に毎回こちらから画像を渡す方式。
   // ライブラリ任せの自動ループが動かない端末があるため、自前で回す。
-  try{ reader = makeReader(); }
-  catch(e){ DIAG.lastErr = 'reader生成失敗 ' + e.message; dbg(); return; }
+  if(!buildCoreReader()){ dbg(); return; }
 
   var v = $(videoId);
   var busy = false;
@@ -610,16 +658,14 @@ function startScan(videoId, onHit, onMiss){
       var ctx = scanCv.getContext('2d');
       ctx.drawImage(v, cx, cy, cw, chh, 0, 0, scanCv.width, scanCv.height);
 
-      reader.decodeFromCanvas(scanCv).then(function(result){
-        busy = false;
+      var result = decodeCanvasSync(scanCv);
+      busy = false;
+      if(result){
         DIAG.hits++;
-        if(scanning) onHit(result.getText());
-      }).catch(function(err){
-        busy = false;
-        var n = String(err && err.name || '');
-        if(n && n !== 'NotFoundException') DIAG.lastErr = n;
-        if(onMiss) onMiss();
-      });
+        if(scanning) onHit(result);
+      } else if(onMiss){
+        onMiss();
+      }
     }catch(e){
       busy = false;
       DIAG.lastErr = e.message;
@@ -935,32 +981,26 @@ function readFromPhoto(file){
       $('oneHint').textContent = '読み取り機能が読み込めていません。通信環境を確認して開き直してください。';
       return;
     }
-    var r = new ZXing.BrowserMultiFormatReader();
-    // 元の大きさと拡大版の2通りで試す（小さく写っている場合の対策）
-    var tries = [1, 2];
-    var i = 0;
-    (function next(){
-      if(i >= tries.length){
-        URL.revokeObjectURL(url);
-        $('oneHint').textContent = 'この写真からバーコードを検出できませんでした。'
-          + 'バーコードが大きく、ピントが合って写っているものを選んでください。';
-        show('oneVerdict', false);
-        beep('ng');
-        return;
-      }
-      var scale = tries[i++];
+    // 等倍・1.5倍・0.6倍で試す（写りの大小に対応）
+    var scales = [1, 1.5, 0.6];
+    for(var i=0;i<scales.length;i++){
       var cv = document.createElement('canvas');
-      cv.width = img.naturalWidth * scale;
-      cv.height = img.naturalHeight * scale;
-      var ctx = cv.getContext('2d');
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(img, 0, 0, cv.width, cv.height);
-      r.decodeFromCanvas(cv).then(function(result){
+      cv.width = Math.round(img.naturalWidth * scales[i]);
+      cv.height = Math.round(img.naturalHeight * scales[i]);
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      var txt = decodeCanvasSync(cv);
+      if(txt){
         URL.revokeObjectURL(url);
         $('oneHint').textContent = '写真から読み取りました。';
-        onOneRead(result.getText(), cv.toDataURL('image/jpeg', 0.9));
-      }).catch(function(){ next(); });
-    })();
+        onOneRead(txt, cv.toDataURL('image/jpeg', 0.9));
+        return;
+      }
+    }
+    URL.revokeObjectURL(url);
+    $('oneHint').textContent = 'この写真からバーコードを検出できませんでした。'
+      + 'バーコードが大きく、ピントが合って写っているものを選んでください。';
+    show('oneVerdict', false);
+    beep('ng');
   };
   img.onerror = function(){
     URL.revokeObjectURL(url);
