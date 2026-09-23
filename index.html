@@ -150,16 +150,21 @@
     <div class="card hidden" id="shotCard">
       <label class="lbl">読み取った瞬間の画像（賞味期限を見比べてください）</label>
       <div class="zoomwrap"><img id="shotImg" class="shot" alt=""></div>
-      <div class="cmp">
-        <div><div class="k">製造データ</div><div class="d" id="cmpData">—</div></div>
-        <div><div class="k">ラベルの印字</div><div class="d" style="color:var(--amber)">目視</div></div>
+      <div id="cmpBox"></div>
+      <div id="kigenVerdict" class="verdict hidden" style="margin-top:10px; padding:12px;">
+        <div class="big" id="kigenBig" style="font-size:24px;"></div>
+        <div class="msg" id="kigenMsg"></div>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="sm on" id="btnKigenOk">期限も一致</button>
+        <button class="sm on" id="btnKigenOk">目視で一致を確認</button>
         <button class="sm" id="btnKigenNg">期限がちがう</button>
       </div>
     </div>
     <div class="card">
+      <div id="scanState" style="display:flex; align-items:center; gap:10px; margin-bottom:8px;">
+        <span id="scanDot" style="width:12px; height:12px; border-radius:50%; background:var(--amber); flex:none;"></span>
+        <span id="scanTxt" style="font-size:15px; font-weight:600;">読み取り中…</span>
+      </div>
       <p class="note" id="oneHint">バーコードを枠の中に入れてください。読み取ると自動で照合します。</p>
     </div>
     <div class="card">
@@ -194,6 +199,10 @@
       <video id="v2" playsinline muted></video>
       <div class="reticle"></div>
       <div class="flash" id="f2"></div>
+    </div>
+    <div id="runState" style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+      <span id="runDot" style="width:12px; height:12px; border-radius:50%; background:var(--amber); flex:none;"></span>
+      <span id="runTxt" style="font-size:14px; color:var(--dim);">カメラ準備中…</span>
     </div>
     <div id="runVerdict" class="verdict hidden">
       <div class="big" id="runBig"></div>
@@ -233,7 +242,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v1.6';
+var VERSION = 'v2.1';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -421,13 +430,17 @@ function pickItem(){
 }
 
 function targetHTML(t){
-  var kigen = t.frozen || t.chilled;
-  var kigenLabel = t.frozen ? '賞味期限 冷凍' : (t.chilled ? '賞味期限 冷蔵' : '賞味期限');
   var h = '<div class="target"><div class="nm">' + esc(t.name) + '</div>'
-        + '<div class="kv"><span class="k">JAN下5桁</span><span class="v">' + esc(t.jan5 || '—') + '</span></div>'
-        + '<div class="kv"><span class="k">' + kigenLabel + '</span><span class="v">' + fmtDate(kigen) + '</span></div>';
-  if(t.frozen && t.chilled){
-    h += '<div class="kv"><span class="k">賞味期限 冷蔵</span><span class="v small">' + fmtDate(t.chilled) + '</span></div>';
+        + '<div class="kv"><span class="k">JAN下5桁</span><span class="v">' + esc(t.jan5 || '—') + '</span></div>';
+  if(t.chilled){
+    h += '<div class="kv"><span class="k">賞味期限 冷蔵</span><span class="v">' + esc(isYmd(t.chilled) ? fmtDate(t.chilled) : t.chilled) + '</span></div>';
+  }
+  if(t.frozen){
+    h += '<div class="kv"><span class="k">賞味期限 冷凍</span><span class="v'
+       + (t.chilled ? ' small' : '') + '">' + esc(isYmd(t.frozen) ? fmtDate(t.frozen) : t.frozen) + '</span></div>';
+  }
+  if(!t.chilled && !t.frozen){
+    h += '<div class="kv"><span class="k">賞味期限</span><span class="v">—</span></div>';
   }
   if(t.note) h += '<div class="kv"><span class="k">注意事項</span><span class="v small">' + esc(t.note) + '</span></div>';
   if(t.shiji) h += '<div class="kv"><span class="k">製造指示数</span><span class="v small">' + t.shiji + ' P</span></div>';
@@ -462,6 +475,7 @@ function stopCamera(){
   scanning = false;
   stopNativeScan();
   stopScanTimer();
+  stopScanWatch();
   try{ if(reader) reader.reset(); }catch(e){}
   if(stream){
     stream.getTracks().forEach(function(t){ t.stop(); });
@@ -574,10 +588,25 @@ function dbg(){
   var txt = lines.filter(function(x){ return x; }).join('\n');
   for(var i=0;i<els.length;i++) els[i].textContent = txt;
 }
+var lastTries = 0, blink = false;
 setInterval(function(){
   var v = $('v1').videoWidth ? $('v1') : $('v2');
   if(v && v.videoWidth){ DIAG.started = true; DIAG.vw = v.videoWidth; DIAG.vh = v.videoHeight; }
   dbg();
+  // ②の画面で「動いている」ことを見せる
+  var dot = $('runDot'), txt = $('runTxt');
+  if(dot && txt && MODE === 'run'){
+    var moving = DIAG.tries > lastTries;
+    lastTries = DIAG.tries;
+    if(moving){
+      blink = !blink;
+      dot.style.background = blink ? 'var(--ok)' : 'var(--line)';
+      txt.textContent = 'スキャン中（読み取り試行 ' + DIAG.tries + ' 回）';
+    } else {
+      dot.style.background = 'var(--ng)';
+      txt.textContent = 'スキャンが止まっています';
+    }
+  }
 }, 500);
 
 /* ---- モードに応じて読み取りを開始する共通入口 ---- */
@@ -713,6 +742,309 @@ function labelPresent(video){
   }catch(e){ return false; }
 }
 
+
+/* ================= 賞味期限の読み取り（OCR） =================
+   Tesseract を使い、数字と区切り記号だけに絞って読む。
+   読めたら製造データと自動照合、読めなければ目視に回す（素通りさせない）。 */
+var TESS_SOURCES = [
+  'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+];
+var tessWorker = null, tessLoading = null;
+
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve();
+  var i = 0;
+  function next(){
+    if(window.Tesseract) return Promise.resolve();
+    if(i >= TESS_SOURCES.length) return Promise.reject(new Error('OCRを読み込めません'));
+    return loadScript(TESS_SOURCES[i++]).then(function(){
+      return window.Tesseract ? Promise.resolve() : next();
+    }).catch(next);
+  }
+  return next();
+}
+
+function getTessWorker(){
+  if(tessWorker) return Promise.resolve(tessWorker);
+  if(tessLoading) return tessLoading;
+  tessLoading = loadTesseract().then(function(){
+    return Tesseract.createWorker('eng');
+  }).then(function(w){
+    return w.setParameters({
+      tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ./-年月日 ',
+      tessedit_pageseg_mode: '6'      // ひとかたまりの文章として読む
+    }).then(function(){
+      tessWorker = w;
+      return w;
+    });
+  });
+  return tessLoading;
+}
+
+/* 期待する日付を、印字されうる数字の並びに展開する */
+function expectedDigitForms(ymd){
+  if(!ymd) return { full: [], ym: [] };
+  var p = ymd.split('-');
+  var Y = p[0], M = p[1], D = p[2];
+  var y2 = Y.slice(2);
+  var m1 = String(Number(M)), d1 = String(Number(D));
+  var full = [
+    Y + M + D,        // 20280309
+    y2 + M + D,       // 280309
+    Y + m1 + d1,      // 202839
+    y2 + m1 + d1      // 2839
+  ];
+  var ym = [ Y + M, y2 + M, Y + m1 ];
+  return {
+    full: full.filter(function(x){ return x.length >= 6; }),
+    ym:   ym.filter(function(x){ return x.length >= 6; })
+  };
+}
+
+/* 区切り記号を挟んだ表記（例 28.3.9 / 2028年3月9日）を元の文から探す */
+function looseDateHit(rawText, ymd){
+  if(!ymd) return false;
+  var p = ymd.split('-');
+  var Y = p[0], y2 = Y.slice(2);
+  var m = String(Number(p[1])), d = String(Number(p[2]));
+  var mm = p[1], dd = p[2];
+  // 年は4桁でも2桁でも、月日は0埋めありでもなしでも可。間の記号は2文字まで許容。
+  var re = new RegExp('(?:' + Y + '|' + y2 + ')[^0-9]{0,3}0?' + m + '[^0-9]{0,3}0?' + d + '(?![0-9])');
+  var t = String(rawText || '').replace(/\s+/g, '');
+  if(re.test(t)) return true;
+  var re2 = new RegExp('(?:' + Y + '|' + y2 + ')[^0-9]{0,3}' + mm + '[^0-9]{0,3}' + dd + '(?![0-9])');
+  return re2.test(t);
+}
+
+/* OCR結果から日付らしい部分を取り出して照合する */
+function matchDate(rawText, ymd){
+  var digits = String(rawText || '').replace(/[^0-9]/g, '');
+  var f = expectedDigitForms(ymd);
+  for(var i=0;i<f.full.length;i++){
+    if(digits.indexOf(f.full[i]) >= 0) return { level:'full', hit:f.full[i], digits:digits };
+  }
+  if(looseDateHit(rawText, ymd)) return { level:'full', hit:'loose', digits:digits };
+  // 完全な日付らしい並び（20xx + 4桁）が読めているのに一致しないなら、年月だけの一致で
+  // 済ませず「不一致」とする。日付違いを見逃さないため。
+  var full8 = digits.match(/20\d{6}/g);
+  if(full8 && full8.length){
+    return { level:'none', hit:full8[0], digits:digits };
+  }
+  for(var j=0;j<f.ym.length;j++){
+    if(digits.indexOf(f.ym[j]) >= 0) return { level:'ym', hit:f.ym[j], digits:digits };
+  }
+  return { level:'none', hit:'', digits:digits };
+}
+
+/* 画像を読みやすく整える（拡大・グレー化・コントラスト強調） */
+function prepForOcr(dataURL){
+  return new Promise(function(res){
+    var im = new Image();
+    im.onload = function(){
+      var scale = Math.min(3, Math.max(1.5, 1600 / im.naturalWidth));
+      var cv = document.createElement('canvas');
+      cv.width = Math.round(im.naturalWidth * scale);
+      cv.height = Math.round(im.naturalHeight * scale);
+      var ctx = cv.getContext('2d');
+      ctx.drawImage(im, 0, 0, cv.width, cv.height);
+      try{
+        var d = ctx.getImageData(0,0,cv.width,cv.height);
+        var a = d.data;
+        for(var i=0;i<a.length;i+=4){
+          var g = (a[i]*299 + a[i+1]*587 + a[i+2]*114)/1000;
+          g = (g - 128) * 1.6 + 128;          // コントラストを上げる
+          g = g < 0 ? 0 : (g > 255 ? 255 : g);
+          a[i] = a[i+1] = a[i+2] = g;
+        }
+        ctx.putImageData(d, 0, 0);
+      }catch(e){}
+      res(cv.toDataURL('image/png'));
+    };
+    im.onerror = function(){ res(dataURL); };
+    im.src = dataURL;
+  });
+}
+
+
+/* 期待値が yyyy-MM-dd 形式の日付かどうか */
+function isYmd(v){
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+}
+
+/* コード表記（BG0908 など）がラベル上にあるか。
+   OCRは英字を読み違えやすいので、英字部分はゆるく、数字部分は厳密に見る。 */
+function codeHit(rawText, code){
+  var c = String(code || '').toUpperCase().replace(/\s+/g, '');
+  if(!c) return false;
+  var t = String(rawText || '').toUpperCase().replace(/\s+/g, '');
+  if(t.indexOf(c) >= 0) return true;                    // そのまま一致
+
+  // 英字+数字に分けて、数字の並びが揃っていれば一致とみなす
+  var m = c.match(/^([A-Z]*)(\d+)$/);
+  if(!m) return false;
+  var letters = m[1], nums = m[2];
+  var digits = t.replace(/[^0-9]/g, '');
+  if(digits.indexOf(nums) < 0) return false;            // 数字が無ければ不一致
+
+  if(!letters) return true;
+  // 数字の直前に英字が来ているかを、記号や誤認を挟んでも拾えるように確認
+  var re = new RegExp('[A-Z0-9]{0,' + (letters.length + 1) + '}' + nums);
+  return re.test(t);
+}
+
+/* 製造データに入っている賞味期限をすべて集める（冷凍・冷蔵の列を問わない） */
+function wantedDates(){
+  var out = [];
+  if(!TARGET) return out;
+  if(TARGET.frozen)  out.push({ label:'冷凍', ymd:TARGET.frozen });
+  if(TARGET.chilled) out.push({ label:'冷蔵', ymd:TARGET.chilled });
+  return out;
+}
+
+/* 比較表示を組み立てる */
+function renderCmp(results){
+  var w = wantedDates();
+  if(!w.length){
+    $('cmpBox').innerHTML = '<p class="note" style="margin:0">製造データに賞味期限が入っていません。</p>';
+    return;
+  }
+  var h = '<div class="cmp">';
+  for(var i=0;i<w.length;i++){
+    var st = results && results[i] ? results[i] : { mark:'…', color:'var(--dim)' };
+    h += '<div>'
+      +   '<div class="k">' + w[i].label + '</div>'
+      +   '<div class="d">' + esc(isYmd(w[i].ymd) ? fmtDate(w[i].ymd) : w[i].ymd) + '</div>'
+      +   '<div style="font-size:12px; margin-top:4px; color:' + st.color + '">' + st.mark + '</div>'
+      + '</div>';
+  }
+  h += '</div>';
+  $('cmpBox').innerHTML = h;
+}
+
+function setKigen(kind, big, msg){
+  var v = $('kigenVerdict');
+  v.className = 'verdict ' + kind;
+  v.style.marginTop = '10px';
+  v.style.padding = '12px';
+  $('kigenBig').textContent = big;
+  $('kigenBig').style.fontSize = '24px';
+  $('kigenMsg').innerHTML = msg;
+  show('kigenVerdict', true);
+}
+
+function runDateOcr(dataURL){
+  var want = wantedDates();
+  if(!want.length){
+    renderCmp(null);
+    setKigen('', '期限データなし', '製造データに賞味期限が入っていません。');
+    return;
+  }
+  renderCmp(null);
+  setKigen('', '賞味期限を読み取り中…', '初回はOCRの準備に少し時間がかかります。');
+
+  prepForOcr(dataURL).then(function(prepared){
+    return getTessWorker().then(function(w){ return w.recognize(prepared); });
+  }).then(function(out){
+    var text = out && out.data ? out.data.text : '';
+    var digits = String(text).replace(/[^0-9]/g, '');
+
+    var results = [], okCnt = 0, ngCnt = 0, unknownCnt = 0;
+    for(var i=0;i<want.length;i++){
+      var hit = false;
+      if(isYmd(want[i].ymd)){
+        var f = expectedDigitForms(want[i].ymd);
+        for(var j=0;j<f.full.length;j++){
+          if(digits.indexOf(f.full[j]) >= 0){ hit = true; break; }
+        }
+        if(!hit) hit = looseDateHit(text, want[i].ymd);
+      } else {
+        hit = codeHit(text, want[i].ymd);   // BG0908 のようなコード表記
+      }
+      if(hit){
+        results.push({ mark:'一致', color:'var(--ok)' });
+        okCnt++;
+      } else if(digits.length < 4 && String(text).replace(/[^A-Za-z0-9]/g,'').length < 4){
+        results.push({ mark:'読取不可', color:'var(--dim)' });
+        unknownCnt++;
+      } else {
+        results.push({ mark:'未検出', color:'var(--ng)' });
+        ngCnt++;
+      }
+    }
+    renderCmp(results);
+
+    var compact = String(text).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    var raw = '<span style="font-size:11px">読取値: ' + esc(compact.slice(0,48)) + '</span>';
+
+    if(okCnt === want.length){
+      setKigen('ok', want.length > 1 ? '期限OK（両方一致）' : '期限OK',
+        'ラベルの印字が製造データと一致しました。<br>' + raw);
+      beep('ok');
+    } else if(unknownCnt === want.length){
+      setKigen('', '読み取れません',
+        '日付を読み取れませんでした。<strong>現物と上の日付を目視で確認してください。</strong><br>'
+        + '日付がはっきり写るように近づけて撮り直すと読める場合があります。');
+    } else if(okCnt > 0){
+      setKigen('', '片方だけ一致',
+        '一方は一致しましたが、もう一方を読み取れませんでした。'
+        + '<strong>残りを目視で確認してください。</strong><br>' + raw);
+    } else {
+      setKigen('ng', '期限ちがいの疑い',
+        '製造データの日付を読み取れませんでした。<strong>必ず現物を確認してください。</strong><br>' + raw);
+      beep('ng');
+    }
+  }).catch(function(e){
+    renderCmp(null);
+    setKigen('', 'OCRを使えません',
+      '日付の自動読み取りを準備できませんでした（' + esc(String(e.message || e)) + '）。<br>'
+      + '上の日付と現物を目視で確認してください。');
+  });
+}
+
+
+/* ================= 読み取れないときの案内 =================
+   無反応のままだと「壊れているのか印字切れなのか」が分からないため、
+   経過時間に応じて状態を返す。 */
+var scanStartAt = 0, stateTimer = null, warnedCut = false;
+
+function setScanState(color, text){
+  var d = $('scanDot'), t = $('scanTxt');
+  if(!d || !t) return;
+  d.style.background = color;
+  t.textContent = text;
+}
+
+function startScanWatch(){
+  scanStartAt = Date.now();
+  warnedCut = false;
+  setScanState('var(--amber)', '読み取り中…');
+  if(stateTimer) clearInterval(stateTimer);
+  stateTimer = setInterval(function(){
+    if(!scanning){ return; }
+    var sec = (Date.now() - scanStartAt) / 1000;
+    if(sec < 3){
+      setScanState('var(--amber)', '読み取り中… ' + sec.toFixed(0) + '秒');
+    } else if(sec < 8){
+      setScanState('var(--amber)', 'まだ読み取れません（' + sec.toFixed(0) + '秒）');
+      $('oneHint').textContent = 'ピントが合うように20〜30cm離し、バーコードが枠の横幅の半分以上になるようにしてください。'
+        + '蛍光灯の反射があると読めません。';
+    } else {
+      setScanState('var(--ng)', '印字切れの疑い（' + sec.toFixed(0) + '秒読めません）');
+      $('oneHint').innerHTML = '<strong>バーコードを読み取れません。</strong><br>'
+        + '撮り方の問題でなければ、印字が切れている可能性があります。現物を目視で確認してください。';
+      if(!warnedCut){
+        warnedCut = true;
+        beep('ng');
+      }
+    }
+  }, 500);
+}
+
+function stopScanWatch(){
+  if(stateTimer){ clearInterval(stateTimer); stateTimer = null; }
+}
+
 /* ================= ① ラベル確認 ================= */
 function enterOne(){
   MODE = 'one';
@@ -723,9 +1055,12 @@ function enterOne(){
   window.scrollTo(0,0);
   startCamera('v1').then(function(){
     scanning = true;
+    startScanWatch();
     startScan('v1', function(code){
       if(!scanning) return;
       scanning = false;
+      stopScanWatch();
+      setScanState('var(--ok)', '読み取りました');
       onOneRead(code);
     });
   }).catch(camError);
@@ -749,12 +1084,14 @@ function grabFrame(videoId){
 function showShot(dataURL){
   if(!dataURL){ show('shotCard', false); return; }
   $('shotImg').src = dataURL;
-  $('cmpData').textContent = TARGET ? fmtDate(TARGET.frozen || TARGET.chilled) : '—';
+  renderCmp(null);
   show('shotCard', true);
 }
 
 function onOneRead(code, shot){
-  showShot(shot !== undefined ? shot : grabFrame('v1'));
+  var img = (shot !== undefined ? shot : grabFrame('v1'));
+  showShot(img);
+  show('kigenVerdict', false);
   var last5 = code.slice(-5);
   var okJan = TARGET.jan5 && last5 === TARGET.jan5;
   var cd = janValid(code);
@@ -763,9 +1100,9 @@ function onOneRead(code, shot){
   if(okJan && cd){
     v.className = 'verdict ok';
     $('oneBig').textContent = '商品OK';
-    $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）<br>'
-      + '賞味期限は上の表示と現物の印字を見比べてください。';
+    $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）';
     beep('ok'); flash('f1','ok');
+    if(img) runDateOcr(img);        // 続けて賞味期限を読む
   } else {
     v.className = 'verdict ng';
     $('oneBig').textContent = okJan ? '要確認' : '商品ちがい';
@@ -773,6 +1110,7 @@ function onOneRead(code, shot){
       + (okJan ? 'チェックデジットが合いません。読み取り不良か、正規のJANでない可能性があります。'
                : '指定した商品のJAN下5桁「' + TARGET.jan5 + '」と一致しません。ラベルを確認してください。');
     beep('ng'); flash('f1','ng');
+    show('kigenVerdict', false);
   }
 }
 
@@ -930,6 +1268,7 @@ $('btnKigenOk').addEventListener('click', function(){
   if(v.className.indexOf('ng') >= 0) return;   // 商品が違う時は期限OKにできない
   $('oneBig').textContent = '確認ずみ';
   $('oneMsg').innerHTML = 'JANと賞味期限の両方を確認しました。';
+  setKigen('ok', '目視で確認ずみ', '作業者が現物を見て一致を確認しました。');
   beep('ok');
 });
 $('btnKigenNg').addEventListener('click', function(){
@@ -1012,7 +1351,10 @@ $('btnRunBack').addEventListener('click', backToSelect);
 $('btnOneRetry').addEventListener('click', function(){
   show('oneVerdict', false);
   show('shotCard', false);
+  show('kigenVerdict', false);
+  $('oneHint').textContent = 'バーコードを枠の中に入れてください。読み取ると自動で照合します。';
   scanning = true;
+  startScanWatch();
 });
 $('btnUndo').addEventListener('click', undo);
 $('btnFinish').addEventListener('click', finish);
