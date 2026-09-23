@@ -242,7 +242,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v2.1';
+var VERSION = 'v2.3';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -312,17 +312,14 @@ function flash(id, kind){
   setTimeout(function(){ el.className = 'flash'; }, 220);
 }
 
-/* ---- JAN13 チェックデジット ---- */
+/* ---- JAN13 の検証 ----
+   商品はすべて13桁のJANのため、13桁以外は誤読として扱う。
+   （8桁として読むと、13桁の一部を切り取って別の数字になることがある） */
 function janValid(code){
-  if(!/^\d{13}$/.test(code)) return /^\d{8}$/.test(code) ? jan8Valid(code) : false;
+  if(!/^\d{13}$/.test(code)) return false;
   var s = 0;
   for(var i=0;i<12;i++) s += Number(code[i]) * (i % 2 ? 3 : 1);
   return (10 - (s % 10)) % 10 === Number(code[12]);
-}
-function jan8Valid(code){
-  var s = 0;
-  for(var i=0;i<7;i++) s += Number(code[i]) * (i % 2 ? 1 : 3);
-  return (10 - (s % 10)) % 10 === Number(code[7]);
 }
 
 /* ================= データ読み込み（JSONP） ================= */
@@ -553,7 +550,7 @@ function prepareEngine(){
 /* ---- 標準機能用の連続読み取り ---- */
 var nativeDet = null, nativeTimer = null;
 function startNativeScan(videoId, onHit, onMiss){
-  if(!nativeDet) nativeDet = new BarcodeDetector({ formats: ['ean_13','ean_8','upc_a'] });
+  if(!nativeDet) nativeDet = new BarcodeDetector({ formats: ['ean_13'] });
   var v = $(videoId);
   var busy = false;
   nativeTimer = setInterval(function(){
@@ -615,14 +612,14 @@ setInterval(function(){
    ZXing の低レベルAPIを直接使う。この経路は動作確認済み。
    （BrowserMultiFormatReader には canvas を直接渡す関数が無い） */
 var coreReader = null, coreHints = null;
+var LAST_POINTS = null;      // 直近に読めたバーコードの座標
+var BARCODE_BOX = null;      // 元映像でのバーコード位置
 
 function buildCoreReader(){
   try{
     coreHints = new Map();
     coreHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      ZXing.BarcodeFormat.EAN_13,
-      ZXing.BarcodeFormat.EAN_8,
-      ZXing.BarcodeFormat.UPC_A
+      ZXing.BarcodeFormat.EAN_13
     ]);
     coreHints.set(ZXing.DecodeHintType.TRY_HARDER, true);
     coreReader = new ZXing.MultiFormatReader();
@@ -644,7 +641,11 @@ function decodeCanvasSync(cv){
     var lum = new ZXing.HTMLCanvasElementLuminanceSource(cv);
     var bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
     var res = coreReader.decode(bmp, coreHints);
-    return res ? res.getText() : '';
+    if(res){
+      try{ LAST_POINTS = res.getResultPoints() || null; }catch(e0){ LAST_POINTS = null; }
+      return res.getText();
+    }
+    return '';
   }catch(e){
     var m = String(e && e.message || '');
     // 「見つからない／チェック不一致」は今は写っていないだけなので記録しない
@@ -691,6 +692,19 @@ function startScan(videoId, onHit, onMiss){
       busy = false;
       if(result){
         DIAG.hits++;
+        // 切り出し枠の中での位置を、元映像の座標に直して覚えておく
+        if(LAST_POINTS && LAST_POINTS.length){
+          var ys = [], xs = [];
+          for(var q=0;q<LAST_POINTS.length;q++){
+            xs.push(cx + LAST_POINTS[q].getX() / scale);
+            ys.push(cy + LAST_POINTS[q].getY() / scale);
+          }
+          BARCODE_BOX = {
+            x0: Math.min.apply(null, xs), x1: Math.max.apply(null, xs),
+            y0: Math.min.apply(null, ys), y1: Math.max.apply(null, ys),
+            vw: sw, vh: sh
+          };
+        }
         if(scanning) onHit(result);
       } else if(onMiss){
         onMiss();
@@ -709,9 +723,7 @@ function stopScanTimer(){
 function makeReader(){
   var hints = new Map();
   var fmts = [
-    ZXing.BarcodeFormat.EAN_13,
-    ZXing.BarcodeFormat.EAN_8,
-    ZXing.BarcodeFormat.UPC_A
+    ZXing.BarcodeFormat.EAN_13
   ];
   hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, fmts);
   hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
@@ -771,13 +783,8 @@ function getTessWorker(){
   tessLoading = loadTesseract().then(function(){
     return Tesseract.createWorker('eng');
   }).then(function(w){
-    return w.setParameters({
-      tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ./-年月日 ',
-      tessedit_pageseg_mode: '6'      // ひとかたまりの文章として読む
-    }).then(function(){
-      tessWorker = w;
-      return w;
-    });
+    tessWorker = w;
+    return w;
   });
   return tessLoading;
 }
@@ -933,6 +940,72 @@ function setKigen(kind, big, msg){
   show('kigenVerdict', true);
 }
 
+/* 数字だけ／英数字だけ、と読むたびに文字種を指定する */
+function recognizeWith(worker, img, mode){
+  var white = (mode === 'code')
+    ? '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    : '0123456789';
+  return worker.setParameters({
+    tessedit_char_whitelist: white,
+    tessedit_pageseg_mode: '6',
+    preserve_interword_spaces: '1'
+  }).then(function(){
+    return worker.recognize(img);
+  });
+}
+
+/* バーコードの位置を手がかりに、日付がありそうな範囲を数パターン切り出す */
+function cropCandidates(dataURL){
+  return new Promise(function(res){
+    var im = new Image();
+    im.onload = function(){
+      var W = im.naturalWidth, H = im.naturalHeight;
+      var bands = [];
+      if(BARCODE_BOX && BARCODE_BOX.vw){
+        // 映像の座標を、静止画の座標に換算する
+        var rx = W / BARCODE_BOX.vw, ry = H / BARCODE_BOX.vh;
+        var bTop = BARCODE_BOX.y0 * ry;
+        // バーコードより上の領域を、下から順に帯で切り出す
+        bands.push({ y: bTop * 0.30, h: bTop * 0.38, tag:'中央' });
+        bands.push({ y: bTop * 0.55, h: bTop * 0.45, tag:'中央下' });
+        bands.push({ y: 0,           h: bTop * 0.45, tag:'上部' });
+        bands.push({ y: 0,           h: H,           tag:'全体' });
+      } else {
+        bands.push({ y: H*0.25, h: H*0.30, tag:'中央' });
+        bands.push({ y: H*0.45, h: H*0.30, tag:'中央下' });
+        bands.push({ y: 0,      h: H*0.35, tag:'上部' });
+        bands.push({ y: 0,      h: H,      tag:'全体' });
+      }
+      var outs = [];
+      for(var i=0;i<bands.length;i++){
+        var b = bands[i];
+        var y = Math.max(0, Math.round(b.y));
+        var hh = Math.min(H - y, Math.round(b.h));
+        if(hh < 40) continue;
+        var scale = Math.min(3, Math.max(1.5, 1400 / W));
+        var cv = document.createElement('canvas');
+        cv.width = Math.round(W * scale);
+        cv.height = Math.round(hh * scale);
+        var ctx = cv.getContext('2d');
+        ctx.drawImage(im, 0, y, W, hh, 0, 0, cv.width, cv.height);
+        try{
+          var d = ctx.getImageData(0,0,cv.width,cv.height), a = d.data;
+          for(var k=0;k<a.length;k+=4){
+            var g = (a[k]*299 + a[k+1]*587 + a[k+2]*114)/1000;
+            g = (g - 128) * 1.7 + 128;
+            a[k] = a[k+1] = a[k+2] = g < 0 ? 0 : (g > 255 ? 255 : g);
+          }
+          ctx.putImageData(d, 0, 0);
+        }catch(e){}
+        outs.push({ url: cv.toDataURL('image/png'), tag: b.tag });
+      }
+      res(outs);
+    };
+    im.onerror = function(){ res([]); };
+    im.src = dataURL;
+  });
+}
+
 function runDateOcr(dataURL){
   var want = wantedDates();
   if(!want.length){
@@ -941,51 +1014,44 @@ function runDateOcr(dataURL){
     return;
   }
   renderCmp(null);
-  setKigen('', '賞味期限を読み取り中…', '初回はOCRの準備に少し時間がかかります。');
+  setKigen('', '賞味期限を読み取り中…', '初回はOCRの準備に時間がかかります（30秒〜1分）。');
 
-  prepForOcr(dataURL).then(function(prepared){
-    return getTessWorker().then(function(w){ return w.recognize(prepared); });
-  }).then(function(out){
-    var text = out && out.data ? out.data.text : '';
-    var digits = String(text).replace(/[^0-9]/g, '');
+  var needCode = false;
+  for(var n=0;n<want.length;n++){ if(!isYmd(want[n].ymd)) needCode = true; }
 
-    var results = [], okCnt = 0, ngCnt = 0, unknownCnt = 0;
-    for(var i=0;i<want.length;i++){
-      var hit = false;
-      if(isYmd(want[i].ymd)){
-        var f = expectedDigitForms(want[i].ymd);
-        for(var j=0;j<f.full.length;j++){
-          if(digits.indexOf(f.full[j]) >= 0){ hit = true; break; }
-        }
-        if(!hit) hit = looseDateHit(text, want[i].ymd);
-      } else {
-        hit = codeHit(text, want[i].ymd);   // BG0908 のようなコード表記
+  var allText = '';
+  cropCandidates(dataURL).then(function(crops){
+    if(!crops.length) crops = [{ url:dataURL, tag:'全体' }];
+    return getTessWorker().then(function(w){
+      // 範囲を変えながら順に読む。全部一致したら途中で打ち切る。
+      var i = 0;
+      function step(){
+        if(i >= crops.length) return Promise.resolve();
+        var c = crops[i++];
+        setKigen('', '賞味期限を読み取り中…', '読み取り範囲：' + c.tag + '（' + i + '/' + crops.length + '）');
+        return recognizeWith(w, c.url, needCode ? 'code' : 'num').then(function(out){
+          var t = (out && out.data ? out.data.text : '') || '';
+          allText += ' ' + t;
+          if(judgeDates(want, allText).okCnt === want.length) return;   // 揃ったので終了
+          return step();
+        }).catch(function(){ return step(); });
       }
-      if(hit){
-        results.push({ mark:'一致', color:'var(--ok)' });
-        okCnt++;
-      } else if(digits.length < 4 && String(text).replace(/[^A-Za-z0-9]/g,'').length < 4){
-        results.push({ mark:'読取不可', color:'var(--dim)' });
-        unknownCnt++;
-      } else {
-        results.push({ mark:'未検出', color:'var(--ng)' });
-        ngCnt++;
-      }
-    }
-    renderCmp(results);
+      return step();
+    });
+  }).then(function(){
+    var r = judgeDates(want, allText);
+    renderCmp(r.results);
+    var compact = String(allText).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    var raw = '<span style="font-size:11px">読取値: ' + esc(compact.slice(0,60)) + '</span>';
 
-    var compact = String(text).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    var raw = '<span style="font-size:11px">読取値: ' + esc(compact.slice(0,48)) + '</span>';
-
-    if(okCnt === want.length){
+    if(r.okCnt === want.length){
       setKigen('ok', want.length > 1 ? '期限OK（両方一致）' : '期限OK',
         'ラベルの印字が製造データと一致しました。<br>' + raw);
       beep('ok');
-    } else if(unknownCnt === want.length){
+    } else if(r.unknownCnt === want.length){
       setKigen('', '読み取れません',
-        '日付を読み取れませんでした。<strong>現物と上の日付を目視で確認してください。</strong><br>'
-        + '日付がはっきり写るように近づけて撮り直すと読める場合があります。');
-    } else if(okCnt > 0){
+        '日付を読み取れませんでした。<strong>現物と上の日付を目視で確認してください。</strong><br>' + raw);
+    } else if(r.okCnt > 0){
       setKigen('', '片方だけ一致',
         '一方は一致しましたが、もう一方を読み取れませんでした。'
         + '<strong>残りを目視で確認してください。</strong><br>' + raw);
@@ -1000,6 +1066,28 @@ function runDateOcr(dataURL){
       '日付の自動読み取りを準備できませんでした（' + esc(String(e.message || e)) + '）。<br>'
       + '上の日付と現物を目視で確認してください。');
   });
+}
+
+/* 読み取った文字列を、期待する日付／コードと突き合わせる */
+function judgeDates(want, text){
+  var digits = String(text).replace(/[^0-9]/g, '');
+  var results = [], okCnt = 0, unknownCnt = 0;
+  for(var i=0;i<want.length;i++){
+    var hit = false;
+    if(isYmd(want[i].ymd)){
+      var f = expectedDigitForms(want[i].ymd);
+      for(var j=0;j<f.full.length;j++){
+        if(digits.indexOf(f.full[j]) >= 0){ hit = true; break; }
+      }
+      if(!hit) hit = looseDateHit(text, want[i].ymd);
+    } else {
+      hit = codeHit(text, want[i].ymd);
+    }
+    if(hit){ results.push({ mark:'一致', color:'var(--ok)' }); okCnt++; }
+    else if(digits.length < 4){ results.push({ mark:'読取不可', color:'var(--dim)' }); unknownCnt++; }
+    else { results.push({ mark:'未検出', color:'var(--ng)' }); }
+  }
+  return { results:results, okCnt:okCnt, unknownCnt:unknownCnt };
 }
 
 
@@ -1089,6 +1177,14 @@ function showShot(dataURL){
 }
 
 function onOneRead(code, shot){
+  // 13桁でなければ誤読。読み取りを続ける。
+  if(!/^\d{13}$/.test(code)){
+    $('oneHint').innerHTML = '<strong>バーコードを正しく読み取れませんでした（' + esc(code) + '）。</strong><br>'
+      + 'バーコード全体が枠に入るように、まっすぐ正面から写してください。';
+    setScanState('var(--amber)', '読み直しています…');
+    scanning = true;              // 止めずに読み直す
+    return;
+  }
   var img = (shot !== undefined ? shot : grabFrame('v1'));
   showShot(img);
   show('kigenVerdict', false);
@@ -1131,6 +1227,7 @@ function enterRun(){
 }
 
 function onRunHit(code){
+  if(!/^\d{13}$/.test(code)) return;   // 誤読は無視する
   var t = Date.now();
   presentSince = 0;                       // 読めたので「読めない状態」をリセット
   if(code === lastCode && t - lastHitAt < GAP_MS){
@@ -1297,7 +1394,7 @@ function readFromPhoto(file){
   var img = new Image();
   img.onload = function(){
     if(ENGINE === 'native'){
-      var det = new BarcodeDetector({ formats: ['ean_13','ean_8','upc_a'] });
+      var det = new BarcodeDetector({ formats: ['ean_13'] });
       det.detect(img).then(function(codes){
         if(codes && codes.length){
           $('oneHint').textContent = '写真から読み取りました。';
