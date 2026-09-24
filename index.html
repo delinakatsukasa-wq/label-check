@@ -174,6 +174,7 @@
 
     <div class="row" style="margin-bottom:10px;">
       <button class="sm" id="btnOneRetry">もう一度読む</button>
+      <button class="sm" id="btnTorch">ライト点灯</button>
       <button class="sm quiet" id="btnOneBack">対象選択へ戻る</button>
     </div>
     <div class="card">
@@ -242,7 +243,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v2.5';
+var VERSION = 'v2.6';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -480,6 +481,8 @@ function stopCamera(){
   stopNativeScan();
   stopScanTimer();
   stopScanWatch();
+  stopFrameRing();
+  torchOn = false; videoTrack = null;
   try{ if(reader) reader.reset(); }catch(e){}
   if(stream){
     stream.getTracks().forEach(function(t){ t.stop(); });
@@ -975,8 +978,8 @@ function cropCandidates(dataURL){
         ? BARCODE_BOX.y0 * (H / BARCODE_BOX.vh)
         : H * 0.87;
       if(bTop < H * 0.2) bTop = H * 0.87;          // 位置が取れないときの保険
-      var hh0 = bTop * 0.18;
-      var offs = [0.30, 0.20, 0.40, 0.52];          // 日付が来やすい順
+      var hh0 = bTop * 0.15;
+      var offs = [0.28, 0.18, 0.38, 0.48, 0.08];    // 日付が来やすい順
       for(var bi=0; bi<offs.length; bi++){
         bands.push({ y: bTop * offs[bi], h: hh0, tag: '帯' + (bi+1) });
       }
@@ -1011,7 +1014,7 @@ function cropCandidates(dataURL){
   });
 }
 
-function runDateOcr(dataURL){
+function runDateOcr(dataURL, shots){
   var want = wantedDates();
   if(!want.length){
     renderCmp(null);
@@ -1025,8 +1028,20 @@ function runDateOcr(dataURL){
   for(var n=0;n<want.length;n++){ if(!isYmd(want[n].ymd)) needCode = true; }
 
   var allText = '';
-  cropCandidates(dataURL).then(function(crops){
+  var sources = (shots && shots.length) ? shots : [dataURL];
+  // 鮮明な順に複数枚、それぞれを帯に分けて読む。どれかで日付が拾えればよい。
+  Promise.all(sources.map(function(u){ return cropCandidates(u); })).then(function(lists){
+    var crops = [];
+    // 1枚目の帯を優先し、次に2枚目…と交互に並べる
+    var maxLen = 0;
+    for(var a=0;a<lists.length;a++) maxLen = Math.max(maxLen, lists[a].length);
+    for(var k=0;k<maxLen;k++){
+      for(var a2=0;a2<lists.length;a2++){
+        if(lists[a2][k]) crops.push({ url:lists[a2][k].url, tag: lists[a2][k].tag + '/' + (a2+1) + '枚目' });
+      }
+    }
     if(!crops.length) crops = [{ url:dataURL, tag:'全体' }];
+    if(crops.length > 10) crops = crops.slice(0, 10);
     return getTessWorker().then(function(w){
       // 範囲を変えながら順に読む。全部一致したら途中で打ち切る。
       var i = 0;
@@ -1151,6 +1166,94 @@ function grabBestFrame(videoId, ms, onTick){
   });
 }
 
+
+/* ================= ブレを止めるためのカメラ設定 =================
+   動かしながら文字を読むには、露出時間（シャッター速度）を短くするのが本筋。
+   対応していない端末では黙って無視される。 */
+var videoTrack = null, torchOn = false;
+
+function tuneCameraForMotion(){
+  if(!stream) return Promise.resolve('');
+  var tr = stream.getVideoTracks()[0];
+  if(!tr) return Promise.resolve('');
+  videoTrack = tr;
+  var caps = {};
+  try{ caps = tr.getCapabilities ? tr.getCapabilities() : {}; }catch(e){}
+  var adv = [], notes = [];
+
+  // 露出時間を、指定できる範囲の短い側に寄せる
+  if(caps.exposureMode && caps.exposureTime){
+    var minT = caps.exposureTime.min, stepT = caps.exposureTime.step || 1;
+    var target = minT + (caps.exposureTime.max - minT) * 0.04;
+    adv.push({ exposureMode:'manual', exposureTime: Math.max(minT, Math.round(target/stepT)*stepT) });
+    notes.push('露出時間を短縮');
+  } else if(caps.exposureMode){
+    adv.push({ exposureMode:'continuous' });
+  }
+  // 暗くなる分はISOで補う
+  if(caps.iso){
+    adv.push({ iso: Math.round(caps.iso.max * 0.7) });
+    notes.push('ISO引き上げ');
+  }
+  // ピントは近距離に固定せず、追従させる
+  if(caps.focusMode && String(caps.focusMode).indexOf('continuous') >= 0){
+    adv.push({ focusMode:'continuous' });
+  }
+  if(!adv.length){
+    DIAG.note = 'この端末では露出を調整できません';
+    return Promise.resolve('');
+  }
+  return tr.applyConstraints({ advanced: adv }).then(function(){
+    DIAG.note = notes.join(' / ') || '標準設定';
+    return DIAG.note;
+  }).catch(function(){
+    DIAG.note = 'この端末では露出を調整できません';
+    return '';
+  });
+}
+
+function toggleTorch(){
+  if(!videoTrack) return;
+  var caps = {};
+  try{ caps = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {}; }catch(e){}
+  if(!caps.torch){
+    banner('この端末ではライトを操作できません。', 'info');
+    return;
+  }
+  torchOn = !torchOn;
+  videoTrack.applyConstraints({ advanced: [{ torch: torchOn }] }).then(function(){
+    var b = $('btnTorch');
+    if(b){ b.className = torchOn ? 'sm on' : 'sm'; b.textContent = torchOn ? 'ライト消灯' : 'ライト点灯'; }
+  }).catch(function(){});
+}
+
+/* ================= 直近フレームの保持 =================
+   読めた瞬間に止まらなくて済むよう、常に数枚を控えておく。 */
+var frameRing = [], RING_MAX = 8, ringTimer = null;
+
+function startFrameRing(videoId){
+  stopFrameRing();
+  frameRing = [];
+  ringTimer = setInterval(function(){
+    var v = $(videoId);
+    if(!v || !v.videoWidth) return;
+    var sc = sharpnessOf(v);
+    frameRing.push({ score: sc, url: grabFrame(videoId), at: Date.now() });
+    if(frameRing.length > RING_MAX) frameRing.shift();
+  }, 110);
+}
+function stopFrameRing(){
+  if(ringTimer){ clearInterval(ringTimer); ringTimer = null; }
+}
+
+/* 控えのうち、くっきりした順に数枚返す */
+function bestFrames(n){
+  var a = frameRing.slice().sort(function(x,y){ return y.score - x.score; });
+  var out = [];
+  for(var i=0;i<a.length && out.length<n;i++) out.push(a[i]);
+  return out;
+}
+
 /* ================= 読み取れないときの案内 =================
    無反応のままだと「壊れているのか印字切れなのか」が分からないため、
    経過時間に応じて状態を返す。 */
@@ -1203,6 +1306,8 @@ function enterOne(){
   window.scrollTo(0,0);
   startCamera('v1').then(function(){
     scanning = true;
+    tuneCameraForMotion();
+    startFrameRing('v1');
     startScanWatch();
     startScan('v1', function(code){
       if(!scanning) return;
@@ -1210,17 +1315,13 @@ function enterOne(){
       scanning = false;
       stopScanWatch();
       setScanState('var(--ok)', '読み取りました');
-      // 日付を読むため、良い1枚を選んでから判定する
-      setScanState('var(--amber)', 'そのまま構えてください…');
-      $('oneHint').innerHTML = '<strong>2秒ほどそのまま静止してください。</strong>賞味期限を読み取ります。';
-      grabBestFrame('v1', 2000, function(left){
-        setScanState('var(--amber)', 'そのまま構えてください… ' + Math.ceil(left/1000) + '秒');
-      }).then(function(best){
-        DIAG.sharp = sharpnessOf($('v1'));
-        setScanState('var(--ok)', '読み取りました');
-        $('oneHint').textContent = 'バーコードを枠の中に入れてください。読み取ると自動で照合します。';
-        onOneRead(code, best);
-      });
+      // 待たずに、控えてある直近フレームから鮮明な数枚を使う
+      var picks = bestFrames(3);
+      DIAG.sharp = picks.length ? picks[0].score : sharpnessOf($('v1'));
+      var shots = [];
+      for(var pi=0; pi<picks.length; pi++) shots.push(picks[pi].url);
+      if(!shots.length) shots = [grabFrame('v1')];
+      onOneRead(code, shots[0], shots);
     });
   }).catch(camError);
 }
@@ -1247,7 +1348,7 @@ function showShot(dataURL){
   show('shotCard', true);
 }
 
-function onOneRead(code, shot){
+function onOneRead(code, shot, shots){
   // 13桁でなければ誤読。読み取りを続ける。
   if(!/^\d{13}$/.test(code)){
     $('oneHint').innerHTML = '<strong>バーコードを正しく読み取れませんでした（' + esc(code) + '）。</strong><br>'
@@ -1269,7 +1370,7 @@ function onOneRead(code, shot){
     $('oneBig').textContent = '商品OK';
     $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）';
     beep('ok'); flash('f1','ok');
-    if(img) runDateOcr(img);        // 続けて賞味期限を読む
+    if(img) runDateOcr(img, shots);   // 続けて賞味期限を読む（複数枚を使う）
   } else {
     v.className = 'verdict ng';
     $('oneBig').textContent = okJan ? '要確認' : '商品ちがい';
@@ -1293,6 +1394,7 @@ function enterRun(){
   window.scrollTo(0,0);
   startCamera('v2').then(function(){
     scanning = true;
+    tuneCameraForMotion();
     startScan('v2', onRunHit, onRunMiss);
   }).catch(camError);
 }
@@ -1431,6 +1533,7 @@ $('btnReload').addEventListener('click', function(){ loadData(); });
 $('btnMode1').addEventListener('click', function(){ if(TARGET) enterOne(); });
 $('btnMode2').addEventListener('click', function(){ if(TARGET) enterRun(); });
 $('btnOneBack').addEventListener('click', backToSelect);
+$('btnTorch').addEventListener('click', toggleTorch);
 $('btnKigenOk').addEventListener('click', function(){
   var v = $('oneVerdict');
   if(v.className.indexOf('ng') >= 0) return;   // 商品が違う時は期限OKにできない
