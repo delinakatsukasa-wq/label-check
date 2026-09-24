@@ -242,7 +242,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v2.3';
+var VERSION = 'v2.5';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -453,15 +453,22 @@ function esc(s){
 /* ================= カメラ ================= */
 function startCamera(videoId){
   var v = $(videoId);
-  return navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: 'environment' },
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      focusMode: 'continuous'
-    },
-    audio: false
-  }).then(function(st){
+  // 賞味期限の細かい文字を読むため、取れるだけ高い解像度で開く。
+  // 対応していない端末では自動的に下の設定に落ちる。
+  var tries = [
+    { facingMode:{ ideal:'environment' }, width:{ ideal:3840 }, height:{ ideal:2160 }, focusMode:'continuous' },
+    { facingMode:{ ideal:'environment' }, width:{ ideal:1920 }, height:{ ideal:1080 }, focusMode:'continuous' },
+    { facingMode:{ ideal:'environment' } }
+  ];
+  var i = 0;
+  function attempt(){
+    return navigator.mediaDevices.getUserMedia({ video: tries[i++], audio:false })
+      .catch(function(e){
+        if(i < tries.length) return attempt();
+        throw e;
+      });
+  }
+  return attempt().then(function(st){
     stream = st;
     v.srcObject = st;
     v.setAttribute('playsinline', '');
@@ -569,7 +576,7 @@ function stopNativeScan(){
 
 
 /* ================= 動作状況の表示 ================= */
-var DIAG = { tries:0, hits:0, lastErr:'', started:false, vw:0, vh:0, note:'' };
+var DIAG = { tries:0, hits:0, lastErr:'', started:false, vw:0, vh:0, note:'', sharp:0 };
 function dbg(){
   var els = document.querySelectorAll('.dbgbox');
   if(!els.length) return;
@@ -579,6 +586,7 @@ function dbg(){
     '読み取り試行: ' + DIAG.tries + ' 回',
     '検出成功: ' + DIAG.hits + ' 回',
     'ZXing読込: ' + (window.ZXing ? 'OK' : '未') + ' / 方式: ' + (DECODE_MODE || '判定中'),
+    '静止画の鮮明さ: ' + (DIAG.sharp ? DIAG.sharp.toFixed(0) + '（大きいほど鮮明。100未満はブレ）' : '—'),
     DIAG.note ? ('メモ: ' + DIAG.note) : '',
     DIAG.lastErr ? ('直近のエラー: ' + DIAG.lastErr) : ''
   ];
@@ -961,28 +969,25 @@ function cropCandidates(dataURL){
     im.onload = function(){
       var W = im.naturalWidth, H = im.naturalHeight;
       var bands = [];
-      if(BARCODE_BOX && BARCODE_BOX.vw){
-        // 映像の座標を、静止画の座標に換算する
-        var rx = W / BARCODE_BOX.vw, ry = H / BARCODE_BOX.vh;
-        var bTop = BARCODE_BOX.y0 * ry;
-        // バーコードより上の領域を、下から順に帯で切り出す
-        bands.push({ y: bTop * 0.30, h: bTop * 0.38, tag:'中央' });
-        bands.push({ y: bTop * 0.55, h: bTop * 0.45, tag:'中央下' });
-        bands.push({ y: 0,           h: bTop * 0.45, tag:'上部' });
-        bands.push({ y: 0,           h: H,           tag:'全体' });
-      } else {
-        bands.push({ y: H*0.25, h: H*0.30, tag:'中央' });
-        bands.push({ y: H*0.45, h: H*0.30, tag:'中央下' });
-        bands.push({ y: 0,      h: H*0.35, tag:'上部' });
-        bands.push({ y: 0,      h: H,      tag:'全体' });
+      // バーコードの上側を、細い帯に分けて順に読む。
+      // 帯を狭くするほど余計な数字（内容量・栄養成分など）が混ざらず精度が上がる。
+      var bTop = (BARCODE_BOX && BARCODE_BOX.vh)
+        ? BARCODE_BOX.y0 * (H / BARCODE_BOX.vh)
+        : H * 0.87;
+      if(bTop < H * 0.2) bTop = H * 0.87;          // 位置が取れないときの保険
+      var hh0 = bTop * 0.18;
+      var offs = [0.30, 0.20, 0.40, 0.52];          // 日付が来やすい順
+      for(var bi=0; bi<offs.length; bi++){
+        bands.push({ y: bTop * offs[bi], h: hh0, tag: '帯' + (bi+1) });
       }
+      bands.push({ y: 0, h: bTop, tag:'全体' });
       var outs = [];
       for(var i=0;i<bands.length;i++){
         var b = bands[i];
         var y = Math.max(0, Math.round(b.y));
         var hh = Math.min(H - y, Math.round(b.h));
         if(hh < 40) continue;
-        var scale = Math.min(3, Math.max(1.5, 1400 / W));
+        var scale = Math.min(4, Math.max(2, 2000 / W));
         var cv = document.createElement('canvas');
         cv.width = Math.round(W * scale);
         cv.height = Math.round(hh * scale);
@@ -1091,6 +1096,61 @@ function judgeDates(want, text){
 }
 
 
+
+/* ================= 静止画の選別 =================
+   バーコードは多少ブレても読めるが、日付の文字はブレると読めない。
+   読み取り後も数枚撮り、輪郭が最もはっきりした1枚をOCRに回す。 */
+var sharpCv = document.createElement('canvas');
+
+/* 輪郭の強さ（隣り合う画素の差の大きさ）でブレ具合を測る */
+function sharpnessOf(video){
+  try{
+    var vw = video.videoWidth, vh = video.videoHeight;
+    if(!vw) return 0;
+    var w = 160, h = 120;
+    sharpCv.width = w; sharpCv.height = h;
+    var ctx = sharpCv.getContext('2d');
+    // 中央付近だけを見る
+    ctx.drawImage(video, vw*0.15, vh*0.15, vw*0.70, vh*0.70, 0, 0, w, h);
+    var d = ctx.getImageData(0,0,w,h).data;
+    var g = new Float32Array(w*h);
+    for(var i=0,j=0;j<g.length;i+=4,j++){
+      g[j] = (d[i]*299 + d[i+1]*587 + d[i+2]*114)/1000;
+    }
+    var sum = 0, n = 0;
+    for(var y=1;y<h-1;y++){
+      for(var x=1;x<w-1;x++){
+        var k = y*w+x;
+        var lap = 4*g[k] - g[k-1] - g[k+1] - g[k-w] - g[k+w];
+        sum += lap*lap; n++;
+      }
+    }
+    return n ? sum/n : 0;
+  }catch(e){ return 0; }
+}
+
+/* 指定ミリ秒のあいだ撮り続け、一番くっきりした1枚を返す */
+function grabBestFrame(videoId, ms, onTick){
+  return new Promise(function(res){
+    var v = $(videoId);
+    var best = { score:-1, url:'' };
+    var startAt = Date.now();
+    var timer = setInterval(function(){
+      var sc = sharpnessOf(v);
+      if(sc > best.score){
+        best.score = sc;
+        best.url = grabFrame(videoId);
+      }
+      var left = ms - (Date.now() - startAt);
+      if(onTick) onTick(Math.max(0, left));
+      if(left <= 0){
+        clearInterval(timer);
+        res(best.url || grabFrame(videoId));
+      }
+    }, 120);
+  });
+}
+
 /* ================= 読み取れないときの案内 =================
    無反応のままだと「壊れているのか印字切れなのか」が分からないため、
    経過時間に応じて状態を返す。 */
@@ -1146,10 +1206,21 @@ function enterOne(){
     startScanWatch();
     startScan('v1', function(code){
       if(!scanning) return;
+      if(!/^\d{13}$/.test(code)) return;    // 誤読は無視して読み直す
       scanning = false;
       stopScanWatch();
       setScanState('var(--ok)', '読み取りました');
-      onOneRead(code);
+      // 日付を読むため、良い1枚を選んでから判定する
+      setScanState('var(--amber)', 'そのまま構えてください…');
+      $('oneHint').innerHTML = '<strong>2秒ほどそのまま静止してください。</strong>賞味期限を読み取ります。';
+      grabBestFrame('v1', 2000, function(left){
+        setScanState('var(--amber)', 'そのまま構えてください… ' + Math.ceil(left/1000) + '秒');
+      }).then(function(best){
+        DIAG.sharp = sharpnessOf($('v1'));
+        setScanState('var(--ok)', '読み取りました');
+        $('oneHint').textContent = 'バーコードを枠の中に入れてください。読み取ると自動で照合します。';
+        onOneRead(code, best);
+      });
     });
   }).catch(camError);
 }
