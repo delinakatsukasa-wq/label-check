@@ -243,7 +243,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v2.6';
+var VERSION = 'v2.7';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -589,6 +589,7 @@ function dbg(){
     '読み取り試行: ' + DIAG.tries + ' 回',
     '検出成功: ' + DIAG.hits + ' 回',
     'ZXing読込: ' + (window.ZXing ? 'OK' : '未') + ' / 方式: ' + (DECODE_MODE || '判定中'),
+    'OCR言語: ' + (TESS_LANG || '未読込'),
     '静止画の鮮明さ: ' + (DIAG.sharp ? DIAG.sharp.toFixed(0) + '（大きいほど鮮明。100未満はブレ）' : '—'),
     DIAG.note ? ('メモ: ' + DIAG.note) : '',
     DIAG.lastErr ? ('直近のエラー: ' + DIAG.lastErr) : ''
@@ -773,7 +774,7 @@ var TESS_SOURCES = [
   'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
   'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
 ];
-var tessWorker = null, tessLoading = null;
+var tessWorker = null, tessLoading = null, TESS_LANG = '';
 
 function loadTesseract(){
   if(window.Tesseract) return Promise.resolve();
@@ -792,7 +793,16 @@ function getTessWorker(){
   if(tessWorker) return Promise.resolve(tessWorker);
   if(tessLoading) return tessLoading;
   tessLoading = loadTesseract().then(function(){
-    return Tesseract.createWorker('eng');
+    // 日本語のラベルなので日本語モードを使う。読み込めない場合は英語に落とす。
+    return Tesseract.createWorker(['jpn', 'eng']).then(function(w){
+      TESS_LANG = 'jpn+eng';
+      return w;
+    }).catch(function(){
+      return Tesseract.createWorker('eng').then(function(w){
+        TESS_LANG = 'eng';
+        return w;
+      });
+    });
   }).then(function(w){
     tessWorker = w;
     return w;
@@ -952,13 +962,14 @@ function setKigen(kind, big, msg){
 }
 
 /* 数字だけ／英数字だけ、と読むたびに文字種を指定する */
+/* 読み取りを実行する。
+   文字種を数字だけに絞ると、日本語混じりの行そのものを認識できなくなるため、
+   絞り込みはせず、読んだ結果から数字を拾う方式にする。
+   psm は「1行」と「かたまり」の2通りを試す。 */
 function recognizeWith(worker, img, mode){
-  var white = (mode === 'code')
-    ? '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    : '0123456789';
   return worker.setParameters({
-    tessedit_char_whitelist: white,
-    tessedit_pageseg_mode: '6',
+    tessedit_char_whitelist: '',
+    tessedit_pageseg_mode: mode === 'line' ? '7' : '6',
     preserve_interword_spaces: '1'
   }).then(function(){
     return worker.recognize(img);
@@ -998,10 +1009,30 @@ function cropCandidates(dataURL){
         ctx.drawImage(im, 0, y, W, hh, 0, 0, cv.width, cv.height);
         try{
           var d = ctx.getImageData(0,0,cv.width,cv.height), a = d.data;
-          for(var k=0;k<a.length;k+=4){
-            var g = (a[k]*299 + a[k+1]*587 + a[k+2]*114)/1000;
-            g = (g - 128) * 1.7 + 128;
-            a[k] = a[k+1] = a[k+2] = g < 0 ? 0 : (g > 255 ? 255 : g);
+          var n = cv.width * cv.height;
+          var gray = new Uint8Array(n);
+          var hist = new Uint32Array(256);
+          for(var k=0,q=0;q<n;k+=4,q++){
+            var g = (a[k]*299 + a[k+1]*587 + a[k+2]*114)/1000 | 0;
+            gray[q] = g; hist[g]++;
+          }
+          // 明暗の境目を自動で決めて、白黒にはっきり分ける
+          var tot=n, sum=0, ii;
+          for(ii=0;ii<256;ii++) sum += ii*hist[ii];
+          var sumB=0, wB=0, best=-1, th=128;
+          for(ii=0;ii<256;ii++){
+            wB += hist[ii];
+            if(!wB) continue;
+            var wF = tot - wB;
+            if(!wF) break;
+            sumB += ii*hist[ii];
+            var mB = sumB/wB, mF = (sum-sumB)/wF;
+            var v = wB*wF*(mB-mF)*(mB-mF);
+            if(v > best){ best = v; th = ii; }
+          }
+          for(var k2=0,q2=0;q2<n;k2+=4,q2++){
+            var bw = gray[q2] > th ? 255 : 0;
+            a[k2] = a[k2+1] = a[k2+2] = bw;
           }
           ctx.putImageData(d, 0, 0);
         }catch(e){}
@@ -1049,11 +1080,16 @@ function runDateOcr(dataURL, shots){
         if(i >= crops.length) return Promise.resolve();
         var c = crops[i++];
         setKigen('', '賞味期限を読み取り中…', '読み取り範囲：' + c.tag + '（' + i + '/' + crops.length + '）');
-        return recognizeWith(w, c.url, needCode ? 'code' : 'num').then(function(out){
+        return recognizeWith(w, c.url, 'block').then(function(out){
           var t = (out && out.data ? out.data.text : '') || '';
           allText += ' ' + t;
-          if(judgeDates(want, allText).okCnt === want.length) return;   // 揃ったので終了
-          return step();
+          if(judgeDates(want, allText).okCnt === want.length) return;
+          // かたまりで読めなければ、1行として読み直す
+          return recognizeWith(w, c.url, 'line').then(function(o2){
+            allText += ' ' + ((o2 && o2.data ? o2.data.text : '') || '');
+            if(judgeDates(want, allText).okCnt === want.length) return;
+            return step();
+          }).catch(function(){ return step(); });
         }).catch(function(){ return step(); });
       }
       return step();
