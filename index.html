@@ -243,7 +243,7 @@
    ======================================================================= */
 var API_URL = 'https://script.google.com/macros/s/AKfycby3pGZLfWWUOWFDMdEYoDZbhZuOIHOgOE5NlRs5QWp-mjM5-kCQLvtzc9X7UpraNw8b/exec';
 
-var VERSION = 'v2.7';
+var VERSION = 'v2.8';
 document.getElementById('verTag').textContent = VERSION;
 
 /* ================= 状態 ================= */
@@ -1209,43 +1209,24 @@ function grabBestFrame(videoId, ms, onTick){
 var videoTrack = null, torchOn = false;
 
 function tuneCameraForMotion(){
+  // 露出を手動で短くするとバーコードの読み取りが落ちたため、
+  // 端末の自動露出に任せる。ピントだけ追従を指定する。
   if(!stream) return Promise.resolve('');
   var tr = stream.getVideoTracks()[0];
   if(!tr) return Promise.resolve('');
   videoTrack = tr;
   var caps = {};
   try{ caps = tr.getCapabilities ? tr.getCapabilities() : {}; }catch(e){}
-  var adv = [], notes = [];
-
-  // 露出時間を、指定できる範囲の短い側に寄せる
-  if(caps.exposureMode && caps.exposureTime){
-    var minT = caps.exposureTime.min, stepT = caps.exposureTime.step || 1;
-    var target = minT + (caps.exposureTime.max - minT) * 0.04;
-    adv.push({ exposureMode:'manual', exposureTime: Math.max(minT, Math.round(target/stepT)*stepT) });
-    notes.push('露出時間を短縮');
-  } else if(caps.exposureMode){
-    adv.push({ exposureMode:'continuous' });
-  }
-  // 暗くなる分はISOで補う
-  if(caps.iso){
-    adv.push({ iso: Math.round(caps.iso.max * 0.7) });
-    notes.push('ISO引き上げ');
-  }
-  // ピントは近距離に固定せず、追従させる
+  var adv = [];
   if(caps.focusMode && String(caps.focusMode).indexOf('continuous') >= 0){
     adv.push({ focusMode:'continuous' });
   }
-  if(!adv.length){
-    DIAG.note = 'この端末では露出を調整できません';
-    return Promise.resolve('');
+  if(caps.exposureMode && String(caps.exposureMode).indexOf('continuous') >= 0){
+    adv.push({ exposureMode:'continuous' });
   }
-  return tr.applyConstraints({ advanced: adv }).then(function(){
-    DIAG.note = notes.join(' / ') || '標準設定';
-    return DIAG.note;
-  }).catch(function(){
-    DIAG.note = 'この端末では露出を調整できません';
-    return '';
-  });
+  DIAG.note = '自動露出';
+  if(!adv.length) return Promise.resolve('');
+  return tr.applyConstraints({ advanced: adv }).catch(function(){});
 }
 
 function toggleTorch(){
@@ -1332,6 +1313,28 @@ function stopScanWatch(){
   if(stateTimer){ clearInterval(stateTimer); stateTimer = null; }
 }
 
+
+/* ================= 賞味期限の確認 =================
+   OCRでの自動読み取りは、この印字では実用精度に届かなかったため目視とする。
+   同じ製造ロットなら全個体が同じ日付になるので、品種ごとに1回確認すれば足りる。 */
+function showKigenCheck(){
+  var want = wantedDates();
+  renderCmp(null);
+  if(!want.length){
+    setKigen('', '期限データなし', '製造データに賞味期限が入っていません。');
+    return;
+  }
+  var list = '';
+  for(var i=0;i<want.length;i++){
+    list += '<div style="font-size:26px; font-weight:800; margin-top:4px;">'
+          + esc(want[i].label) + '　' + esc(isYmd(want[i].ymd) ? fmtDate(want[i].ymd) : want[i].ymd)
+          + '</div>';
+  }
+  setKigen('', '賞味期限を確認してください',
+    '上の画像と現物を見比べてください。<br>' + list
+    + '<div style="font-size:12px; margin-top:6px;">一致していれば「目視で一致を確認」を押してください。</div>');
+}
+
 /* ================= ① ラベル確認 ================= */
 function enterOne(){
   MODE = 'one';
@@ -1406,7 +1409,7 @@ function onOneRead(code, shot, shots){
     $('oneBig').textContent = '商品OK';
     $('oneMsg').innerHTML = '読み取り：' + code + '（下5桁 ' + last5 + '）';
     beep('ok'); flash('f1','ok');
-    if(img) runDateOcr(img, shots);   // 続けて賞味期限を読む（複数枚を使う）
+    showKigenCheck();                 // 賞味期限は目視で確認してもらう
   } else {
     v.className = 'verdict ng';
     $('oneBig').textContent = okJan ? '要確認' : '商品ちがい';
